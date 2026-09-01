@@ -1,0 +1,17 @@
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Local vector storage and databases
+brain_memory/
+*.db
+*.sqlite3
+
+# Large AI model weights
+*.gguf
+*.bin
+*.safetensors
+
+# Environment secrets
+.env
