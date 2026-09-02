@@ -15,3 +15,6 @@ brain_memory/
 
 # Environment secrets
 .env
+# Local runtime data
+var/
+.env
