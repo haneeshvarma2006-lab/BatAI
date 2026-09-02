@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Request, Response
 
 from bat import __version__
 from bat.api.deps import Config, CurrentContext, Store
@@ -34,7 +34,7 @@ async def healthz(settings: Config) -> HealthResponse:
 
 @router.get("/readyz", response_model=ReadinessResponse, summary="Readiness probe")
 async def readyz(
-    store: Store, settings: Config, response: Response
+    request: Request, store: Store, settings: Config, response: Response
 ) -> ReadinessResponse:
     """Exercise each dependency; report 503 when any of them is unusable."""
     checks: dict[str, str] = {}
@@ -46,12 +46,22 @@ async def readyz(
         logger.warning("session store not ready", exc_info=exc)
         checks["session_store"] = "unavailable"
 
-    # The model server and vector store are checked here once their adapters
-    # land; declaring them "not_configured" is honest rather than optimistic.
-    checks["vector_store"] = (
-        "ok" if settings.vector.mode != "memory" else "ephemeral"
+    checks["vector_store"] = "ok" if settings.vector.mode != "memory" else "ephemeral"
+    checks["embeddings"] = (
+        "ok" if settings.embedding.is_configured else "non_semantic_fallback"
     )
-    checks["model_server"] = "not_configured"
+
+    # The model is in-process, so readiness means "weights resident", not
+    # "a server is reachable". Reporting ready before the load finishes would
+    # send traffic to a replica that then blocks for the whole load.
+    llm = getattr(request.app.state, "llm", None)
+    if llm is None:
+        checks["model"] = "not_configured"
+    elif llm.is_loaded:
+        checks["model"] = "loaded"
+        checks["inference_queue"] = str(llm.queue_depth)
+    else:
+        checks["model"] = "unavailable"
 
     ready = all(v != "unavailable" for v in checks.values())
     if not ready:

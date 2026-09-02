@@ -44,6 +44,10 @@ DEFAULT_SCOPES: frozenset[Scope] = frozenset(
         Scope.SESSIONS_WRITE,
         Scope.AGENT_INVOKE,
         Scope.MEMORY_READ,
+        # Writing to your own tenant's memory is an ordinary user action,
+        # not a privileged one -- a key that cannot feed its own index has
+        # no usable RAG. Cross-tenant writes remain impossible regardless.
+        Scope.MEMORY_WRITE,
     }
 )
 

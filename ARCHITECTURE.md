@@ -1,8 +1,11 @@
 # BAT Platform Architecture
 
-Target: a commercial, multi-tenant agentic AI platform on FastAPI.
-Status: the API/tenancy/session module is implemented; the RAG pipeline and the
-agent loop are specified here and have ports waiting for them in `bat/ports/`.
+Target: a commercial, multi-tenant agentic AI platform on FastAPI, running
+**native in-process inference** over local `.gguf` weights.
+
+Status: tenancy, the API, native inference, the RAG pipeline and the agent loop
+are implemented. Durable storage (Postgres/Redis) and the sandboxed tool runtime
+are specified here and have ports waiting for them.
 
 ---
 
@@ -21,6 +24,7 @@ actively hostile to the target:
 | `engine.py` vs `core/brain.py` | Two divergent brains — an intent-router and a tool-caller. Only one can be the product. |
 | In-process `working_memory` list | Lost on restart, invisible to other replicas. |
 | Blocking `ollama.chat` in a request path | Stalls the event loop; one slow generation blocks every other request on the worker. |
+| Ollama as the engine | Removed entirely. Inference is now in-process against a local `.gguf`; see §4a. |
 | `server.py` (untracked) — `f'ollama run bat-engine "{prompt}"'` with `shell=True` | Shell injection. A prompt containing `"` and `;` runs commands. |
 
 The through-line: **on your laptop, ambient authority is the feature. Behind a
@@ -29,10 +33,12 @@ a retrieved document, an uploaded PDF, a web result — becomes the attacker's
 proxy. Prompt injection promotes to RCE unless the tool boundary refuses by
 default.
 
-Nothing above needs to be thrown away. `core/brain.py`'s tool-calling loop is
-the right shape; it needs a tenancy boundary around it and a policy gate under
-it. `engine.py` should be retired once its live-API tools are re-registered as
-policy-gated tools.
+Nothing above was thrown away wholesale. `core/brain.py`'s tool-calling loop was
+the right shape and became `bat/services/agent/loop.py`, with a tenancy boundary
+around it and a policy gate under it; `core/brain.py` is now a thin desktop
+wrapper over that. `engine.py` has been deleted — it was the Ollama-based
+duplicate brain, and its live-API tools are listed in §6 for re-registration as
+policy-gated `NETWORK` tools.
 
 ---
 
@@ -53,7 +59,7 @@ the API knows nothing about ChromaDB.
 │  domain/       Tenant · Session · Message · errors      │  pure types
 └─────────────────────────────────────────────────────────┘
         ▲
-        └── adapters/  Chroma · Redis · Postgres · Ollama  (implement ports)
+        └── adapters/  llama.cpp · Chroma · Redis · Postgres  (implement ports)
 ```
 
 Ports are `typing.Protocol`, so adapters need no base class and tests can pass a
@@ -109,16 +115,20 @@ GET    /v1/sessions/{id}/messages            transcript
 POST   /v1/sessions/{id}/messages            one turn, buffered
 POST   /v1/sessions/{id}/messages/stream     one turn, SSE
 GET    /v1/whoami                            resolve the calling credential
+POST   /v1/memory/documents                  chunk, embed and index
+GET    /v1/memory/search                     query tenant memory
+GET    /v1/memory/context                    preview the agent's context block
+DELETE /v1/memory                            erase this tenant's memory
 GET    /healthz  /readyz                     liveness / readiness
 ```
 
 **Async model.** Handlers are `async`. The blocking dependencies do not belong
 on the event loop, and each has a specific answer:
 
-- *Model server* — `ollama.AsyncClient` over httpx. A process-wide semaphore
-  (`model.max_concurrency`) protects the model server from being swamped.
-- *ChromaDB* — the client is sync; calls go through
-  `anyio.to_thread.run_sync` in the adapter, never inline in a handler.
+- *Inference* — blocking C++ on a dedicated single-worker executor, never on
+  the loop. One generation at a time per process; see §4a.
+- *ChromaDB* — the client is sync; calls go through `asyncio.to_thread` in the
+  adapter, never inline in a handler.
 - *Long turns* — SSE, not a blocking POST. The connection streams tokens as
   they are produced and a keepalive comment every 15s so proxies don't reap an
   idle connection during a tool call.
@@ -148,7 +158,40 @@ hard global limit they move behind Redis with no change to call sites.
 
 ---
 
-## 5. RAG memory pipeline (specified; ports in `bat/ports/retrieval.py`)
+## 4a. Native inference
+
+Inference runs inside the API process via `llama-cpp-python`. There is no model
+server and no network hop. Three properties of llama.cpp shape the adapter:
+
+1. **`Llama` is not thread-safe.** Two concurrent calls corrupt its KV cache, so
+   every call is funnelled through a `ThreadPoolExecutor(max_workers=1)` —
+   serialisation by construction, not by remembering a lock.
+2. **Calls are blocking C++.** Nothing touches `Llama` off that executor, so the
+   event loop is never stalled.
+3. **Loading is slow and memory-heavy.** Weights load once in the lifespan,
+   before the app reports ready.
+
+Streaming bridges the thread to the loop with `call_soon_threadsafe` onto an
+unbounded queue, and a `threading.Event` the producer checks between tokens so a
+client disconnect actually stops the work. The queue is unbounded deliberately:
+a bounded one deadlocks, because the producer blocks in `put` while the consumer
+sits in its `finally` waiting for the producer. Generation is already bounded by
+`max_tokens`.
+
+**The capacity consequence, stated plainly.** The model is now a *serialised*
+resource, and each worker holds a full copy of the weights. `max_queue_depth`
+bounds the wait and over-depth callers get 429 with `Retry-After` rather than
+silent queueing. This is the right trade for self-hosted and single-tenant
+deployments; at multi-tenant scale it is a throughput ceiling that the previous
+Ollama split did not have, and the answer is a dedicated inference tier behind
+the same `LLMClient` port.
+
+Embeddings use a **second** `Llama` on its own executor. Sharing one instance
+would stall user-facing generation behind a bulk document ingest.
+
+---
+
+## 5. RAG memory pipeline (implemented)
 
 Three replaceable stages so Chroma stays an implementation detail:
 
@@ -168,8 +211,8 @@ anything with more than one worker must run Chroma in server mode
 (`vector.mode="http"`). `Settings._harden` refuses to boot production on
 `mode="memory"`.
 
-Improvements over the current `search_all`, which fires three fixed queries and
-concatenates whatever comes back:
+Implemented in `bat/services/rag/`. Improvements over the old `search_all`,
+which fired three fixed queries and concatenated whatever came back:
 
 - **Score thresholds.** Chroma always returns `n_results` rows. Today an
   unrelated stored fact gets injected as "USER PROFILE MEMORY" with equal
@@ -184,7 +227,7 @@ concatenates whatever comes back:
 
 ---
 
-## 6. Agent loop (specified; ports in `bat/ports/agent.py`, `tools.py`)
+## 6. Agent loop (implemented)
 
 ```
 build prompt (system + RAG context + history + user)
@@ -251,12 +294,17 @@ loop may run them.
 
 ```
 client ─► edge (TLS, WAF, unauthenticated flood control)
-           └─► uvicorn workers (stateless)
+           └─► uvicorn workers  (each loads its OWN copy of the weights)
+                 ├─► llama.cpp  in-process, one generation at a time
                  ├─► Postgres   sessions, transcripts, tenants, keys, tool audit
                  ├─► Redis      rate limits, run leases, idempotency keys
-                 ├─► Chroma     server mode, one collection per tenant
-                 └─► model      Ollama/vLLM pool, semaphore-guarded
+                 └─► Chroma     server mode, one collection per tenant
 ```
+
+Workers are stateless *apart from the weights*, which changes the scaling shape:
+a worker is now expensive to start (model load) and expensive in RAM. Size the
+worker count by memory, not by CPU, and keep `preload=true` so a replica does
+not report ready before it can actually serve.
 
 Workers hold no state, so they scale horizontally and restart freely.
 `Settings._harden` fails the boot — loudly, before serving a request — on any
@@ -270,12 +318,19 @@ in-memory sessions or vectors, or tool isolation below `SUBPROCESS`.
 | # | Module | Depends on | Status |
 | --- | --- | --- | --- |
 | 1 | Tenancy, settings, session store, API, SSE | — | **done** |
-| 2 | `PostgresSessionStore`, `RedisRateLimiter` | 1 | next |
-| 3 | `OllamaClient` (async, semaphore, retries) | 1 | next |
-| 4 | RAG pipeline + `ChromaVectorStore` | 1, 3 | then |
-| 5 | Tool registry, executor, sandbox runner | 1, 3 | then |
-| 6 | Agent loop replacing `ReferenceAgentRunner` | 3, 4, 5 | then |
-| 7 | Billing, usage metering, admin API | 1–6 | later |
+| 2 | `LlamaCppClient` — native in-process inference | 1 | **done** |
+| 3 | Local `.gguf` embeddings | 2 | **done** |
+| 4 | RAG pipeline + Chroma / in-memory vector stores | 1, 3 | **done** |
+| 5 | Tool registry + policy executor | 1 | **done** |
+| 6 | Agent loop replacing `ReferenceAgentRunner` | 2, 4, 5 | **done** |
+| 7 | `PostgresSessionStore`, `RedisRateLimiter` | 1 | next |
+| 8 | Sandboxed tool runtime, then re-register tools | 5 | next |
+| 9 | Billing, usage metering, admin API | 1–8 | later |
+
+Item 2 is written and tested against a fake that reproduces llama.cpp's
+blocking, non-thread-safe behaviour, but has **not** been run against real
+weights — no wheel for Python 3.14 and no `.gguf` on the machine. See the
+README for what to verify first.
 
 Each row lands behind a port that already exists, so nothing above it changes
 when it does.

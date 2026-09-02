@@ -3,3 +3,11 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.9
 pydantic-settings>=2.5
+
+# RAG storage. Optional: BAT_VECTOR__MODE=memory runs without it.
+chromadb>=1.0
+
+# Native inference. Install separately -- it needs a wheel matching your
+# interpreter, or cmake + a C++ toolchain to build:
+#   pip install llama-cpp-python
+# Python 3.12 has prebuilt wheels; 3.14 currently does not.

@@ -13,16 +13,24 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator
 from datetime import timedelta
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from bat import __version__
 from bat.adapters.agent_reference import ReferenceAgentRunner
+from bat.adapters.llama_cpp_client import LlamaCppClient
+from bat.adapters.llama_cpp_embedder import HashingEmbedder, LlamaCppEmbedder
 from bat.adapters.session_store_memory import InMemorySessionStore
+from bat.adapters.vector_chroma import ChromaVectorStore
+from bat.adapters.vector_memory import InMemoryVectorStore
+from bat.services.agent.loop import NativeAgentRunner
+from bat.services.agent.tools import InMemoryToolRegistry, PolicyToolExecutor
+from bat.services.rag.pipeline import LocalMemoryPipeline
 from bat.api.errors import install_error_handlers
 from bat.api.middleware import BodySizeLimitMiddleware, CorrelationMiddleware
-from bat.api.routers import health, messages, sessions
+from bat.api.routers import health, memory, messages, sessions
 from bat.api.security import ApiKeyAuthenticator
 from bat.observability import configure_logging
 from bat.ports.session_store import SessionStore
@@ -60,6 +68,54 @@ def build_session_store(settings: Settings) -> SessionStore:
     )
 
 
+
+def build_embedder(settings: Settings) -> Any:
+    """Local .gguf embeddings when configured, else a deterministic stand-in.
+
+    The stand-in is not semantic. It keeps the pipeline runnable without weights
+    for development and tests; production is refused without a real model.
+    """
+    if settings.embedding.is_configured:
+        return LlamaCppEmbedder(settings.embedding)
+    if settings.environment.is_production:  # pragma: no cover - guarded earlier
+        raise RuntimeError("embedding.model_path is required in production")
+    logger.warning(
+        "no embedding model configured; using non-semantic HashingEmbedder. "
+        "Retrieval quality will be poor -- set BAT_EMBEDDING__MODEL_PATH."
+    )
+    return HashingEmbedder()
+
+
+def build_vector_store(settings: Settings, embedder: Any) -> Any:
+    if settings.vector.mode == "memory":
+        return InMemoryVectorStore(embedder)
+    return ChromaVectorStore(settings.vector, embedder)
+
+
+def build_agent_runner(settings: Settings, llm: Any, memory: Any) -> Any:
+    """The native loop when weights are configured, else the reference runner.
+
+    Falling back keeps the API serviceable on a machine without a .gguf; the
+    production guard in `Settings._harden` stops that fallback ever shipping.
+    """
+    if not settings.model.is_configured:
+        logger.warning(
+            "no model weights configured; serving the reference runner. "
+            "Set BAT_MODEL__MODEL_PATH to a .gguf for real inference."
+        )
+        return ReferenceAgentRunner()
+
+    registry = InMemoryToolRegistry()
+    return NativeAgentRunner(
+        llm=llm,
+        memory=memory,
+        registry=registry,
+        executor=PolicyToolExecutor(registry),
+        vector_settings=settings.vector,
+        model_name=settings.model.name,
+    )
+
+
 async def _purge_loop(store: SessionStore, interval_s: float = _PURGE_INTERVAL_S) -> None:
     """Background reaper for expired sessions."""
     while True:
@@ -83,8 +139,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.settings = settings
         app.state.session_store = build_session_store(settings)
-        app.state.agent_runner = ReferenceAgentRunner()
         app.state.authenticator = ApiKeyAuthenticator(settings.api_keys)
+
+        embedder = build_embedder(settings)
+        vector_store = build_vector_store(settings, embedder)
+        app.state.embedder = embedder
+        app.state.vector_store = vector_store
+        app.state.memory = LocalMemoryPipeline(
+            store=vector_store, settings=settings.vector
+        )
+        app.state.llm = (
+            LlamaCppClient(settings.model) if settings.model.is_configured else None
+        )
+        app.state.agent_runner = build_agent_runner(
+            settings, app.state.llm, app.state.memory
+        )
         app.state.run_limiter = ConcurrencyLimiter(
             limit=settings.rate_limit.max_concurrent_runs
         )
@@ -102,6 +171,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "no API keys configured; every request will be rejected with 401"
             )
 
+        if app.state.llm is not None and settings.model.preload:
+            # Load before serving: the first request would otherwise block for
+            # the whole load, and /readyz would lie about being ready.
+            try:
+                await app.state.llm.load()
+            except Exception:
+                logger.exception(
+                    "model preload failed; the API will start but agent turns "
+                    "will fail until the weights load"
+                )
+
         purge_task = asyncio.create_task(_purge_loop(app.state.session_store))
         logger.info(
             "bat api started",
@@ -109,6 +189,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "version": __version__,
                 "environment": str(settings.environment),
                 "session_backend": settings.session.backend,
+                "model": settings.model.name if settings.model.is_configured else None,
+                "vector_mode": settings.vector.mode,
                 "tenants_configured": len({k.tenant_id for k in settings.api_keys}),
             },
         )
@@ -118,6 +200,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             purge_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await purge_task
+            for resource in (app.state.llm, embedder):
+                closer = getattr(resource, "close", None)
+                if closer is not None:
+                    with contextlib.suppress(Exception):
+                        await closer()
             logger.info("bat api stopped")
 
     app = FastAPI(
@@ -150,6 +237,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(sessions.router)
     app.include_router(messages.router)
+    app.include_router(memory.router)
 
     return app
 

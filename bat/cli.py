@@ -52,14 +52,29 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     print(f"environment       {settings.environment}")
     print(f"session backend   {settings.session.backend}")
     print(f"vector mode       {settings.vector.mode}")
-    print(f"model             {settings.model.name} @ {settings.model.host}")
+    print(f"model             {settings.model.name}")
+    print(f"weights           {settings.model.model_path or 'NOT CONFIGURED'}")
+    print(f"embeddings        {settings.embedding.model_path or 'hashing fallback'}")
     print(f"credentials       {len(settings.api_keys)} key(s), "
           f"{len({k.tenant_id for k in settings.api_keys})} tenant(s)")
     print(f"tool isolation    >= {settings.agent.min_tool_isolation.name}")
     print(f"enabled tools     {sorted(settings.agent.enabled_tools) or 'none'}")
 
+    warnings: list[str] = []
     if not settings.api_keys:
-        print("\nwarning: no API keys configured; every request returns 401")
+        warnings.append("no API keys configured; every request returns 401")
+    if not settings.model.is_configured:
+        warnings.append(
+            "no .gguf weights; agent turns fall back to the reference runner"
+        )
+    if not settings.embedding.is_configured:
+        warnings.append(
+            "no embedding model; retrieval uses a non-semantic fallback"
+        )
+    for warning in warnings:
+        print(f"\nwarning: {warning}", end="")
+    if warnings:
+        print()
     return 0
 
 

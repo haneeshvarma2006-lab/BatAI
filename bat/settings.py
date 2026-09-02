@@ -61,16 +61,94 @@ class ApiKeyRecord(BaseModel):
 
 
 class ModelSettings(BaseModel):
+    """Native llama.cpp inference settings.
+
+    Inference runs *inside* this process against a local .gguf file. There is no
+    model server, so the model is a process-local resource: one instance serves
+    one generation at a time and every worker holds its own full copy of the
+    weights in RAM. `max_queue_depth` is the admission bound that keeps that
+    honest under load -- see `bat.adapters.llama_cpp_client`.
+    """
+
     model_config = {"frozen": True}
 
-    provider: Literal["ollama"] = "ollama"
-    host: str = "http://127.0.0.1:11434"
+    provider: Literal["llama_cpp"] = "llama_cpp"
+    #: Path to the .gguf weights. Required before the API will serve turns.
+    model_path: Path | None = None
+    #: Display name used in logs and usage records.
     name: str = "bat-engine"
+
+    # -- llama.cpp load parameters ---------------------------------------
+    n_ctx: int = Field(default=8192, gt=0)
+    #: Layers offloaded to GPU. 0 = pure CPU; -1 = offload everything.
+    n_gpu_layers: int = Field(default=0, ge=-1)
+    #: Generation threads. None lets llama.cpp pick from the CPU count.
+    n_threads: int | None = Field(default=None, gt=0)
+    n_batch: int = Field(default=512, gt=0)
+    #: Chat template. None uses the template embedded in the .gguf metadata.
+    chat_format: str | None = None
+    seed: int | None = None
+    use_mmap: bool = True
+    use_mlock: bool = False
+    verbose: bool = False
+
+    # -- generation defaults ---------------------------------------------
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.95, gt=0.0, le=1.0)
     max_tokens: int = Field(default=2048, gt=0)
-    request_timeout_s: float = Field(default=90.0, gt=0)
-    #: Concurrent generations allowed per process, to protect the model server.
-    max_concurrency: int = Field(default=8, gt=0)
+    repeat_penalty: float = Field(default=1.1, gt=0)
+    request_timeout_s: float = Field(default=180.0, gt=0)
+
+    # -- admission --------------------------------------------------------
+    #: Callers allowed to wait for the single generation slot before new ones
+    #: are rejected outright. Queueing beyond this only burns client deadlines.
+    max_queue_depth: int = Field(default=8, gt=0)
+    #: Block startup until the weights are loaded. Off means the first request
+    #: pays the load cost and /readyz reports not-ready until it finishes.
+    preload: bool = True
+
+    @model_validator(mode="after")
+    def _check_paths(self) -> ModelSettings:
+        if self.model_path is not None and self.model_path.suffix.lower() != ".gguf":
+            raise ValueError(f"model_path must be a .gguf file, got {self.model_path}")
+        return self
+
+    @property
+    def is_configured(self) -> bool:
+        return self.model_path is not None
+
+
+class EmbeddingSettings(BaseModel):
+    """Embedding model for the RAG pipeline.
+
+    A separate .gguf loaded with ``embedding=True``. Kept distinct from the chat
+    model because embedding a document while a generation is in flight would
+    otherwise contend for the same serialized instance.
+    """
+
+    model_config = {"frozen": True}
+
+    model_path: Path | None = None
+    n_ctx: int = Field(default=2048, gt=0)
+    n_gpu_layers: int = Field(default=0, ge=-1)
+    n_threads: int | None = Field(default=None, gt=0)
+    n_batch: int = Field(default=512, gt=0)
+    #: Embed in batches so a large ingest does not hold the slot indefinitely.
+    batch_size: int = Field(default=16, gt=0)
+    normalize: bool = True
+    verbose: bool = False
+
+    @model_validator(mode="after")
+    def _check_paths(self) -> EmbeddingSettings:
+        if self.model_path is not None and self.model_path.suffix.lower() != ".gguf":
+            raise ValueError(
+                f"embedding model_path must be a .gguf file, got {self.model_path}"
+            )
+        return self
+
+    @property
+    def is_configured(self) -> bool:
+        return self.model_path is not None
 
 
 class VectorSettings(BaseModel):
@@ -83,11 +161,13 @@ class VectorSettings(BaseModel):
     host: str | None = None
     port: int = 8000
     ssl: bool = False
-    embedding_model: str = "nomic-embed-text"
     chunk_size: int = Field(default=1000, gt=0)
     chunk_overlap: int = Field(default=150, ge=0)
     default_top_k: int = Field(default=5, gt=0)
     context_token_budget: int = Field(default=1500, gt=0)
+    #: Retrieved chunks scoring below this are dropped rather than padding
+    #: the prompt with near-irrelevant text at full authority.
+    min_score: float = Field(default=0.25, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _check_mode(self) -> VectorSettings:
@@ -165,6 +245,7 @@ class Settings(BaseSettings):
 
     api_keys: tuple[ApiKeyRecord, ...] = ()
     model: ModelSettings = ModelSettings()
+    embedding: EmbeddingSettings = EmbeddingSettings()
     vector: VectorSettings = VectorSettings()
     session: SessionSettings = SessionSettings()
     rate_limit: RateLimitSettings = RateLimitSettings()
@@ -197,6 +278,10 @@ class Settings(BaseSettings):
         problems: list[str] = []
         if not self.api_keys:
             problems.append("no api_keys configured; the API would reject every request")
+        if not self.model.is_configured:
+            problems.append(
+                "model.model_path is unset; the API cannot serve a single agent turn"
+            )
         if "*" in self.cors_origins:
             problems.append("cors_origins may not be '*' in production")
         if self.vector.mode == "memory":

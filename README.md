@@ -1,8 +1,11 @@
 # BAT
 
-A multi-tenant agentic AI platform: FastAPI backend, RAG memory over ChromaDB,
-and a policy-gated agent loop that runs tools under an explicit capability
-model.
+A multi-tenant agentic AI platform: FastAPI backend, **native in-process
+inference** over local `.gguf` weights via `llama-cpp-python`, RAG memory over
+ChromaDB, and a policy-gated agent loop that runs tools under an explicit
+capability model.
+
+No model server. No Ollama. No network hop for inference or embeddings.
 
 Full design rationale lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
@@ -15,15 +18,23 @@ Full design rationale lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | Tenancy, auth, scopes | **implemented** |
 | Session + transcript store | **implemented** (in-memory adapter; Postgres pending) |
 | HTTP API, SSE streaming, rate limits | **implemented** |
-| Ports for RAG / LLM / tools / agent | **implemented** |
-| Native `llama-cpp-python` inference | **in progress** — see [Roadmap](#roadmap) |
-| RAG pipeline (Chroma adapter) | specified, ports landed |
-| Agent loop + tool executor | specified, ports landed; a reference runner stands in |
+| Native `llama-cpp-python` inference | **implemented** — untested against real weights, see below |
+| Local `.gguf` embeddings | **implemented** |
+| RAG pipeline (chunk → embed → retrieve → budgeted context) | **implemented** |
+| Vector stores (in-memory + Chroma) | **implemented** |
+| Agent loop + policy-gated tool executor | **implemented** |
+| Postgres sessions, Redis limits | pending |
+| Sandboxed tool runtime | pending — no tool ships enabled |
 
-37 tests pass. The agent currently answers via `ReferenceAgentRunner`, a
-deterministic stand-in that exercises the whole streaming contract without
-contacting a model. Swapping in the real loop is a one-line change in the
-lifespan because both sit behind `AgentRunner`.
+72 tests pass, covering tenant isolation, auth, scopes, limits, streaming,
+chunking, retrieval, tool policy and the agent loop.
+
+**The inference path has not been run against a real model.** It is verified
+against a fake that reproduces llama.cpp's awkward properties — blocking calls
+and a non-thread-safe handle — so the adapter's threading, admission, streaming
+and timeout logic is genuinely exercised. What is unverified is llama.cpp
+itself: real weights, real tokenizer, real chat template. See
+[Running real inference](#running-real-inference).
 
 ---
 
@@ -32,6 +43,10 @@ lifespan because both sit behind `AgentRunner`.
 ```bash
 pip install -r requirements.txt
 ```
+
+The API starts without weights — the agent falls back to a reference runner and
+retrieval uses a non-semantic hash embedder, so you can exercise every endpoint
+before downloading a model. Both fallbacks are refused in production.
 
 Mint a key (the plaintext is shown once; only its SHA-256 digest is stored):
 
@@ -81,6 +96,13 @@ curl -N -X POST http://127.0.0.1:8000/v1/sessions/$SESSION_ID/messages/stream -H
 | `GET` | `/v1/sessions/{id}/messages` | `sessions:read` |
 | `POST` | `/v1/sessions/{id}/messages` | `agent:invoke` |
 | `POST` | `/v1/sessions/{id}/messages/stream` | `agent:invoke` |
+| `POST` | `/v1/memory/documents` | `memory:write` |
+| `GET` | `/v1/memory/search` | `memory:read` |
+| `GET` | `/v1/memory/context` | `memory:read` |
+| `DELETE` | `/v1/memory` | `memory:write` |
+
+`/v1/memory/context` returns the exact block the agent would prepend for a
+query, which makes retrieval debuggable rather than a black box.
 
 Auth is `Authorization: Bearer <key>` or `X-API-Key: <key>`.
 
@@ -99,12 +121,16 @@ The streaming endpoint emits SSE frames named `token`, `tool_call`,
 bat/
   domain/       pure types: tenancy, sessions, messages, errors
   ports/        protocols: SessionStore, LLMClient, MemoryPipeline, Tool, AgentRunner
-  adapters/     implementations behind those protocols
+  adapters/     llama.cpp client + embedder, Chroma / in-memory vector stores,
+                session store
   api/          routers, dependencies, auth, middleware, error handlers
   settings.py   typed env-driven config with production hardening
   ratelimit.py  per-tenant token bucket + run concurrency cap
   cli.py        issue-key / check-config / serve
-tests/          37 stdlib unittest cases
+  services/
+    rag/        chunking + the tenant-facing memory pipeline
+    agent/      the loop and the policy-gated tool executor
+tests/          72 stdlib unittest cases
 ```
 
 Dependencies point inward. The domain knows nothing about FastAPI; the API
@@ -180,41 +206,68 @@ streaming — rather than line count.
 
 ---
 
+## Running real inference
+
+Point the config at a `.gguf` and restart — no code change:
+
+```bash
+pip install llama-cpp-python
+```
+
+```
+BAT_MODEL__MODEL_PATH=./models/your-model.Q4_K_M.gguf
+BAT_EMBEDDING__MODEL_PATH=./models/nomic-embed-text-v1.5.Q4_K_M.gguf
+```
+
+Three environment blockers on this machine, recorded so they don't need
+rediscovering:
+
+1. **No `llama-cpp-python` wheel for Python 3.14.** It resolves only as an
+   sdist; `pip install --only-binary=:all:` finds no distribution. **Python 3.12
+   has prebuilt wheels and is the supported path.**
+2. **No build toolchain** — neither `cmake` nor MSVC `cl.exe` is on PATH, so a
+   source build fails until one is installed.
+3. **No `.gguf` weights** anywhere under the project.
+
+Two things to check first with real weights, because they are model-specific and
+a fake cannot cover them:
+
+- **Chat template.** `BAT_MODEL__CHAT_FORMAT` defaults to the template embedded
+  in the `.gguf`. If replies come back with role markers leaking into the text,
+  set it explicitly.
+- **Tool calling.** Native tool calls need a chat format that supports them
+  (`chatml-function-calling`, functionary, …). With a format that doesn't, the
+  model emits tool calls as prose and `wants_tools` stays false. Tools ship
+  disabled, so this affects nothing until you enable one — the durable fix is
+  GBNF grammar-constrained decoding.
+
+### The capacity trade-off
+
+In-process inference makes the model a **serialised** resource: `Llama` is not
+thread-safe, so one instance serves one generation at a time, and every worker
+holds its own full copy of the weights in RAM. The adapter handles this honestly
+— a single-worker executor for thread safety, a bounded queue, and 429 with
+`Retry-After` when the queue is full rather than silent queueing.
+
+But it is a real ceiling, and it is the one thing the Ollama split gave you for
+free: a separate model server can be scaled and pooled independently of the API.
+For a self-hosted or single-tenant deployment this is the right trade. For the
+multi-tenant target at scale, expect to reintroduce a dedicated inference tier —
+behind `LLMClient`, so it is an adapter swap and nothing above it changes.
+
+---
+
 ## Roadmap
 
-Next up: **replace Ollama with native in-process inference via
-`llama-cpp-python`**, loading `.gguf` weights directly.
-
-Three environment blockers found while scoping that work, recorded so they
-don't need rediscovering:
-
-1. **No `llama-cpp-python` wheel for Python 3.14.** The package resolves only
-   as an sdist on this interpreter; `pip install --only-binary=:all:` finds no
-   distribution. Either build from source or run the backend on Python 3.12,
-   which has prebuilt wheels.
-2. **No build toolchain present** — neither `cmake` nor MSVC `cl.exe` is on
-   PATH, so a source build will fail until one is installed.
-3. **No `.gguf` weights on disk** anywhere under the project.
-
-The design consequence to settle before writing the adapter: `llama.cpp`'s
-`Llama` object is not thread-safe and one instance serves one generation at a
-time, so in-process inference makes the model a serialized resource and each
-worker holds a full copy of the weights in RAM. That is fine for a self-hosted
-or single-tenant deployment; for the multi-tenant target it caps throughput in a
-way the current Ollama-as-a-service split does not. The adapter will therefore
-own a dedicated worker thread with bounded admission and honest backpressure.
-
-Then, in order:
-
-| # | Module | Depends on |
+| # | Module | Status |
 | --- | --- | --- |
-| 1 | Tenancy, settings, sessions, API, SSE | — (**done**) |
-| 2 | `LlamaCppClient` — native inference behind `LLMClient` | 1 |
-| 3 | `PostgresSessionStore`, Redis-backed limits | 1 |
-| 4 | RAG pipeline + `ChromaVectorStore` + local embeddings | 1, 2 |
-| 5 | Tool registry, executor, sandbox runner | 1, 2 |
-| 6 | Real agent loop replacing `ReferenceAgentRunner` | 2, 4, 5 |
-| 7 | Billing, usage metering, admin API | 1–6 |
+| 1 | Tenancy, settings, sessions, API, SSE | **done** |
+| 2 | `LlamaCppClient` — native inference | **done** (unverified on real weights) |
+| 3 | RAG pipeline, local embeddings, vector stores | **done** |
+| 4 | Agent loop + tool executor | **done** |
+| 5 | `PostgresSessionStore`, Redis-backed limits | next |
+| 6 | Sandboxed tool runtime, then re-register tools | next |
+| 7 | Billing, usage metering, admin API | later |
 
 Each lands behind a port that already exists, so nothing above it changes when
 it does.
@@ -223,7 +276,15 @@ it does.
 
 ## Legacy code
 
-`main.py`, `core/`, `memory/` and `tools/` are the original single-user desktop
-assistant. They still run, and they are the reference for what the platform must
-eventually do — but they are not part of the `bat/` package and are being
-retired module by module as the equivalents land.
+`main.py` and `core/brain.py` are the desktop CLI. They were rewritten for
+native inference and are now thin wrappers over `bat/` — same loop, same
+retrieval, same tool policy, just one fixed local tenant and no auth. Run it
+with `python main.py`.
+
+`engine.py` was **deleted**: it was the Ollama-based duplicate brain, superseded
+by `bat/services/agent/loop.py`. It remains in git history.
+
+`memory/chroma_cloud.py` and `tools/` are the original single-user modules.
+Nothing imports them any more — `memory/` is superseded by
+`bat/services/rag/`, and `tools/` waits on the sandboxed runtime. They are left
+in place as the reference for what to port, not as live code.
