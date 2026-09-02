@@ -1,0 +1,49 @@
+[project]
+name = "bat-platform"
+version = "0.1.0"
+description = "Multi-tenant agentic AI platform"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+]
+
+[project.optional-dependencies]
+# Not yet imported by bat/: these land with the RAG and agent modules.
+rag = ["chromadb>=1.0", "pypdf>=5.0"]
+model = ["ollama>=0.4", "httpx>=0.27"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "mypy>=1.11", "ruff>=0.6"]
+
+[project.scripts]
+bat = "bat.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["bat*"]
+
+[tool.ruff]
+line-length = 96
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "RUF", "ANN"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "ANN"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+disallow_any_explicit = false
+plugins = []
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
