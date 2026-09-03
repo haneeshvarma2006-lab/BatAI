@@ -262,7 +262,13 @@ class AgentSettings(BaseModel):
     #: the tool handler avoids that entirely.
     #:
     #: Raise it only for a model and handler you have actually verified keep
-    #: tool results intact across rounds.
+    #: tool results intact across rounds. Two shapes were tried on Qwen2.5-3B
+    #: and both failed, so this is a measured default rather than caution:
+    #: with the tool protocol's own messages the model rebuilt the expression
+    #: from scratch and got it wrong; with prior results flattened into plain
+    #: turns it emitted "functions.calculator:" and no call at all. Flattening
+    #: *does* work for writing the final answer -- but only when tools are not
+    #: advertised on that turn, which is exactly what a value of 1 arranges.
     tool_rounds_per_turn: int = Field(default=1, gt=0)
     #: Ceiling on what a tool may reach. HOST is refused in production: a tool
     #: with host reach on shared infrastructure turns prompt injection into

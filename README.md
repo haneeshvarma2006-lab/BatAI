@@ -20,23 +20,34 @@ Full design rationale lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | HTTP API, SSE streaming, rate limits | **implemented** |
 | Native `llama-cpp-python` inference | **implemented and running** on real weights |
 | Local `.gguf` embeddings | **implemented** |
-| RAG pipeline (chunk → embed → retrieve → budgeted context) | **implemented** |
+| RAG pipeline (chunk → embed → retrieve → budgeted context) | **implemented and verified on real Chroma** |
 | Vector stores (in-memory + Chroma) | **implemented** |
 | Agent loop + policy-gated tool executor | **implemented** |
 | Built-in tools + subprocess sandbox | **implemented** |
 | Global rate limits + run leases (Redis) | **implemented** |
 | Container-isolated code execution | pending — `python_exec` is desktop-only |
 
-131 tests pass, covering tenant isolation, auth, scopes, limits, streaming,
+140 tests pass, covering tenant isolation, auth, scopes, limits, streaming,
 chunking, retrieval, sandbox containment, tool policy, the agent loop and the
 Redis limiters (against real Lua execution).
 
-**The inference path has not been run against a real model.** It is verified
-against a fake that reproduces llama.cpp's awkward properties — blocking calls
-and a non-thread-safe handle — so the adapter's threading, admission, streaming
-and timeout logic is genuinely exercised. What is unverified is llama.cpp
-itself: real weights, real tokenizer, real chat template. See
-[Running real inference](#running-real-inference).
+### Verified end to end
+
+The whole product has been driven over real HTTP against real weights and a real
+ChromaDB — not through direct function calls:
+
+```
+readiness    {'session_store': 'ok', 'vector_store': 'ok',
+              'embeddings': 'ok', 'model': 'loaded'}
+ingest       201  1 chunk indexed
+SSE turn     "Alice Trent owns the billing service and is on call on
+              Thursdays."     <- from the document ingested seconds earlier
+tool turn    "The result of 27 * 43 + 119 is 1280."
+isolation    globex memory search -> []   globex reads acme session -> 404
+```
+
+Everything below the "Running the model" heading is what it took to get there,
+including the parts that did not work.
 
 ---
 
@@ -373,6 +384,55 @@ Repeated identical calls within a turn are also served from a per-turn cache
 rather than re-run — small models re-request a tool instead of using the answer
 already in front of them. Tools declaring `deterministic=False` (a clock, a live
 feed) are never cached.
+
+### Three bugs only a live run could find
+
+Every one of these passed a full unit suite first. They are recorded because
+each names a class of thing fakes cannot catch.
+
+**1. Chroma collection creation was wrong.** The adapter passed
+`{"hnsw:space": "cosine"}` as the second positional argument to
+`get_or_create_collection`. In chromadb 1.5.9 that parameter is `configuration`,
+not `metadata`, and the failure surfaces as
+`'dict' object has no attribute 'serialize_to_json'` — which names neither the
+argument nor the call. Now passed by keyword, with `embedding_function=None` so
+Chroma cannot quietly install its default and download an ONNX model into a
+second, inconsistent vector space.
+
+**2. Merely advertising tools corrupted ordinary answers.** Asked a plain
+RAG question with tools enabled, the model returned `functions.memory_search:`
+— the handler's own internal prefix, as the message body. It is not a tool call,
+so the loop handed it to the user as the final reply. The loop now detects that
+shape and retries with tools withdrawn, which puts the model back on its own
+chat template. Same question, after the fix: *"Alice Trent owns the billing
+service and is on call on Thursdays."*
+
+**3. Tools were advertised to principals who could not run them.** The policy
+allowlist and the principal's scopes are separate gates, and only the policy was
+consulted when deciding what to show the model. A key without `tools:execute`
+was offered the calculator, called it, was denied by the executor, and told the
+user *"I need to use the calculator tool, but it seems I don't have
+permission."* — a wasted turn to report a misconfiguration. Advertisement now
+respects both gates. This is presentation only: the executor still re-checks
+scopes on every invocation, so nothing about enforcement changed.
+
+### Multi-round tool calling does not work with this model
+
+Tested, not assumed. A two-step task (compute, then double the result) under
+`chatml-function-calling`:
+
+| Round-two history | Result |
+| --- | --- |
+| tool-protocol messages | rebuilt the expression from scratch, wrongly |
+| flattened to plain turns | emitted `functions.calculator:`, no call |
+
+Flattening *does* work for writing the final answer — but only when tools are
+not advertised on that turn, which is exactly what `tool_rounds_per_turn=1`
+arranges. So the agent gets one round of tools per turn: it cannot call a tool,
+read the result, and then call a different one. That is a real capability limit
+of this model and handler, not a design preference.
+
+---
 
 ### CUDA on this hardware
 

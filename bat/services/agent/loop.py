@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -56,6 +57,21 @@ REPEAT_NOTICE = (
     "result as before, not a new one. Do not call it again -- use this value to "
     "answer the user now.]\n"
 )
+
+#: llama.cpp's tool-calling handlers sometimes emit their own internal
+#: prefix as the assistant's message -- "functions.calculator:" with nothing
+#: useful after it -- instead of either a structured call or an answer. It is
+#: not a tool call, so the loop would happily hand it to the user as the final
+#: reply. Observed on Qwen2.5-3B for ordinary questions, not just tool ones:
+#: merely *advertising* tools was enough to corrupt a plain RAG answer.
+_HANDLER_LEAK = re.compile(r"^\s*(functions?\.\w+\s*:|<\|?tool_call\|?>)", re.I)
+
+
+def _is_unusable(content: str) -> bool:
+    """True when a tool-turn reply is handler noise rather than an answer."""
+    stripped = content.strip()
+    return not stripped or bool(_HANDLER_LEAK.match(stripped))
+
 
 SYSTEM_PROMPT = """You are {name}, a helpful assistant.
 
@@ -137,6 +153,22 @@ class NativeAgentRunner:
                     completion_tokens += completion.completion_tokens
 
                     if not completion.wants_tools:
+                        if _is_unusable(completion.content):
+                            # The tool handler produced noise instead of an
+                            # answer. Retrying with tools withdrawn puts the
+                            # model back on its own chat template, which
+                            # answers correctly -- rather than handing the
+                            # user "functions.calculator:".
+                            logger.info(
+                                "tool handler returned no usable content; "
+                                "retrying without tools",
+                                extra={
+                                    "tenant_id": request.context.tenant_id,
+                                    "preview": completion.content[:60],
+                                },
+                            )
+                            specs = ()
+                            continue
                         if request.stream_tokens and completion.content:
                             yield TokenEvent(text=completion.content)
                         yield FinalEvent(
@@ -274,11 +306,37 @@ class NativeAgentRunner:
             return ""
 
     def _advertise(self, request: RunRequest) -> Sequence[ToolSpec]:
+        """Offer only tools this caller could actually run.
+
+        The policy allowlist and the principal's scopes are separate gates, and
+        both must pass. Advertising a tool the principal lacks the scope for
+        burns a turn and surfaces the denial to the user as the model's own
+        confusion -- observed verbatim: "I need to use the calculator tool, but
+        it seems I don't have permission."
+
+        This is presentation, not enforcement: the executor re-checks scopes on
+        every invocation regardless of what was advertised.
+        """
         if self._registry is None or self._executor is None:
             return ()
         if request.policy.max_calls_per_run <= 0:
             return ()
-        return tuple(self._registry.specs_for(request.policy))
+
+        principal = request.context.principal
+        permitted: list[ToolSpec] = []
+        for spec in self._registry.specs_for(request.policy):
+            try:
+                definition = self._registry.get(spec.name).definition
+            except Exception:  # pragma: no cover - registry inconsistency
+                continue
+            if all(principal.has(scope) for scope in definition.required_scopes):
+                permitted.append(spec)
+            else:
+                logger.debug(
+                    "tool withheld: principal lacks its scopes",
+                    extra={"tool": spec.name, "tenant_id": request.context.tenant_id},
+                )
+        return tuple(permitted)
 
     async def _invoke_deduplicated(
         self,

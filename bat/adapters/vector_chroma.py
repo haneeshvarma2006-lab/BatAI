@@ -79,9 +79,18 @@ class ChromaVectorStore:
                 self._client = await asyncio.to_thread(self._build_client)
             collection = await asyncio.to_thread(
                 self._client.get_or_create_collection,
-                namespace,
+                name=namespace,
                 # Cosine, to match the normalised vectors the embedder emits.
-                {"hnsw:space": "cosine"},
+                # Passed by keyword on purpose: the second *positional*
+                # parameter is `configuration`, not `metadata`, so a dict
+                # given positionally is rejected with a confusing
+                # "'dict' object has no attribute 'serialize_to_json'".
+                metadata={"hnsw:space": "cosine"},
+                # Chroma otherwise installs a default embedding function that
+                # downloads an ONNX model on first use. Every vector here comes
+                # from the local .gguf embedder, so that would be a hidden
+                # network dependency and a second, inconsistent vector space.
+                embedding_function=None,
             )
             self._collections[namespace] = collection
             return collection

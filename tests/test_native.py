@@ -31,7 +31,7 @@ from bat.ports.tools import (
     ToolInvocation,
     ToolPolicy,
 )
-from bat.services.agent.loop import REPEAT_NOTICE, NativeAgentRunner
+from bat.services.agent.loop import REPEAT_NOTICE, NativeAgentRunner, _is_unusable
 from bat.services.agent.tools import (
     InMemoryToolRegistry,
     PolicyToolExecutor,
@@ -707,6 +707,100 @@ class TestNativeAgentRunner(unittest.TestCase):
             )
         )
         self.assertEqual(Clock.runs, 2, "a non-deterministic tool must re-run")
+
+
+    def test_handler_noise_is_retried_without_tools(self) -> None:
+        """Advertising tools must not corrupt an ordinary answer.
+
+        llama.cpp's tool handler sometimes returns its own prefix as the
+        message. It is not a tool call, so without this the loop hands the user
+        "functions.memory_search:" as the final reply -- observed on a plain
+        RAG question through the real API.
+        """
+        registry = InMemoryToolRegistry([EchoTool()])
+        llm = ScriptedLLM(
+            [Completion(content="functions.memory_search:")],
+            stream_text="Alice owns the billing service.",
+        )
+        runner = NativeAgentRunner(
+            llm=llm, registry=registry, executor=PolicyToolExecutor(registry)
+        )
+        events = run(
+            self.drain(
+                runner,
+                self.request(
+                    policy=ToolPolicy(
+                        allowed=frozenset({"echo"}), max_authority=Authority.PURE
+                    )
+                ),
+            )
+        )
+        finals = [e for e in events if isinstance(e, FinalEvent)]
+        self.assertEqual(len(finals), 1)
+        self.assertIn("Alice owns the billing service.", finals[0].content)
+        self.assertNotIn("functions.", finals[0].content)
+        self.assertEqual(llm.calls[1]["tools"], [], "the retry must withdraw tools")
+
+    def test_leak_detection_does_not_flag_ordinary_prose(self) -> None:
+        for good in (
+            "The calculation result is 1280.",
+            "Functions like these are useful.",
+            "Alice owns billing.",
+        ):
+            self.assertFalse(_is_unusable(good), good)
+        for bad in ("functions.calculator:", "  functions.x: ", "<tool_call>", ""):
+            self.assertTrue(_is_unusable(bad), repr(bad))
+
+
+    def test_tools_the_principal_cannot_run_are_not_advertised(self) -> None:
+        """Otherwise the model is offered a tool, tries it, is denied, and
+        tells the user it lacks permission -- burning a turn to say so."""
+        registry = InMemoryToolRegistry([EchoTool()])
+        llm = ScriptedLLM([], "no tools offered")
+        runner = NativeAgentRunner(
+            llm=llm, registry=registry, executor=PolicyToolExecutor(registry)
+        )
+        # Policy allows it; the principal lacks Scope.TOOLS_EXECUTE.
+        self.context = make_context(scopes=frozenset({Scope.AGENT_INVOKE}))
+        run(
+            self.drain(
+                runner,
+                self.request(
+                    policy=ToolPolicy(
+                        allowed=frozenset({"echo"}), max_authority=Authority.PURE
+                    )
+                ),
+            )
+        )
+        self.assertEqual(llm.calls[0]["tools"], [])
+
+    def test_tools_are_advertised_when_the_principal_has_the_scope(self) -> None:
+        from bat.domain.conversation import ToolCall
+
+        registry = InMemoryToolRegistry([EchoTool()])
+        llm = ScriptedLLM(
+            [
+                Completion(
+                    content="",
+                    tool_calls=(ToolCall(id="c", name="echo", arguments={"text": "hi"}),),
+                )
+            ],
+            stream_text="done",
+        )
+        runner = NativeAgentRunner(
+            llm=llm, registry=registry, executor=PolicyToolExecutor(registry)
+        )
+        run(
+            self.drain(
+                runner,
+                self.request(
+                    policy=ToolPolicy(
+                        allowed=frozenset({"echo"}), max_authority=Authority.PURE
+                    )
+                ),
+            )
+        )
+        self.assertEqual([s.name for s in llm.calls[0]["tools"]], ["echo"])
 
     def test_llm_failure_produces_a_single_error_event(self) -> None:
         class BrokenLLM:
