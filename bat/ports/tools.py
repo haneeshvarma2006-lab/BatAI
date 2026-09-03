@@ -115,6 +115,11 @@ class ToolDefinition:
     max_output_chars: int = 8_000
     #: Requires an explicit human confirmation before the loop may run it.
     requires_confirmation: bool = False
+    #: Identical arguments give the same answer for the duration of one turn,
+    #: so a repeat can be served from the turn's cache instead of re-running.
+    #: Set False for anything time-varying -- a clock, live weather, a queue
+    #: depth -- where the second call may legitimately differ.
+    deterministic: bool = True
 
     def to_spec(self) -> ToolSpec:
         """Render the model-facing advertisement of this tool."""

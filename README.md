@@ -329,20 +329,50 @@ BAT_MODEL__N_GPU_LAYERS=0
 
 `n_gpu_layers=-1` offloads every layer that fits; the CPU build ignores it.
 
-### `chat_format` is not optional if you want tools
+### Tool calling needs two chat templates, not one
 
-Under a `.gguf`'s own embedded template, Qwen2.5 emits its tool call as **plain
-text**:
+This took three wrong turns to pin down, so the reasoning is worth keeping.
+
+**Under the `.gguf`'s own template**, Qwen2.5 emits its tool call as plain text:
 
 ```
 <tool_call>{"name": "calculator", "arguments": {"expression": "27 * 43 + 119"}}</tool_call>
 ```
 
-The loop never sees a tool call, `wants_tools` stays false, and the agent
-answers without using the tool — silently, with no error anywhere. Setting
-`BAT_MODEL__CHAT_FORMAT=chatml-function-calling` makes llama-cpp-python parse
-those blocks into structured calls. Verified: with it set, the model calls
-`calculator` and gets 1280 for `27 * 43 + 119`.
+The loop never sees a call, `wants_tools` stays false, and the agent answers
+without the tool — silently, no error anywhere.
+
+**Under `chatml-function-calling`**, calls parse correctly — but the answer that
+follows is wrong. Measured, repeatedly: the calculator returned **1280** and the
+model replied **1160**, then 1220, then 3381. It was inventing a number while
+the correct one sat in its context. That is the worst failure mode available:
+a confident wrong answer built on top of correct data.
+
+Prompting does not fix it — a strict "report the tool's value verbatim" system
+prompt made it *worse*. Nor is it the model: given the identical conversation
+under the `.gguf`'s own template, it answers 1280 every time. The handler
+rewrites the conversation when it renders the prompt, and a history that already
+contains tool results comes back corrupted.
+
+So the two halves of a tool turn use different templates:
+
+| Turn | Template | Why |
+| --- | --- | --- |
+| may emit a tool call | `tool_chat_format` | parses `<tool_call>` blocks |
+| writes the answer | `chat_format` | keeps the tool result intact |
+
+The loop switches by dropping the tool advertisement after
+`agent.tool_rounds_per_turn` rounds (default **1**), which is what selects the
+plain template. Raise it only for a model and handler you have actually verified
+keep tool results intact across rounds.
+
+Verified end to end after the fix: one call to `calculator`, and the answer
+reads "The calculation result is 1280."
+
+Repeated identical calls within a turn are also served from a per-turn cache
+rather than re-run — small models re-request a tool instead of using the answer
+already in front of them. Tools declaring `deterministic=False` (a clock, a live
+feed) are never cached.
 
 ### CUDA on this hardware
 

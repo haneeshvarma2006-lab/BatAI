@@ -23,11 +23,12 @@ RAG-augmented generation.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
-from bat.domain.conversation import Message, Role
+from bat.domain.conversation import Message, Role, ToolResult
 from bat.domain.errors import BatError
 from bat.ports.agent import (
     AgentEvent,
@@ -40,10 +41,21 @@ from bat.ports.agent import (
     ToolResultEvent,
 )
 from bat.ports.llm import ChatMessage, ToolSpec
-from bat.ports.tools import ToolInvocation
+from bat.ports.tools import SideEffect, ToolInvocation
 from bat.settings import VectorSettings
 
 logger = logging.getLogger("bat.agent.loop")
+
+#: Prefixed to a cached observation when the model asks for the same thing
+#: twice. Small quantised models do this routinely -- they re-request a tool
+#: rather than using the answer already in front of them. Re-running wastes a
+#: step and, worse, teaches nothing: the identical result comes back and the
+#: model repeats again. Saying so explicitly is what breaks the cycle.
+REPEAT_NOTICE = (
+    "[You already called this tool with these exact arguments. This is the same "
+    "result as before, not a new one. Do not call it again -- use this value to "
+    "answer the user now.]\n"
+)
 
 SYSTEM_PROMPT = """You are {name}, a helpful assistant.
 
@@ -82,6 +94,11 @@ class NativeAgentRunner:
         loop = asyncio.get_running_loop()
         expires_at = loop.time() + request.deadline_s
         tool_budget = request.policy.max_calls_per_run
+        # Keyed by (name, canonical arguments) for this turn only. Never
+        # persisted: caching a tool result across turns would serve stale data
+        # the user has since changed.
+        observed: dict[tuple[str, str], ToolResult] = {}
+        tool_rounds_left = request.tool_rounds_per_turn
         steps = 0
         prompt_tokens = 0
         completion_tokens = 0
@@ -147,7 +164,9 @@ class NativeAgentRunner:
                         yield ToolCallEvent(
                             call_id=call.id, name=call.name, arguments=call.arguments
                         )
-                        result = await self._invoke(request, call)
+                        result = await self._invoke_deduplicated(
+                            request, call, observed
+                        )
                         yield ToolResultEvent(
                             call_id=result.call_id,
                             name=result.name,
@@ -163,9 +182,14 @@ class NativeAgentRunner:
                             )
                         )
 
-                    if tool_budget <= 0:
-                        # Out of budget: force a final answer from what we have
-                        # rather than looping into another tool request.
+                    tool_rounds_left -= 1
+                    if tool_budget <= 0 or tool_rounds_left <= 0:
+                        # Stop offering tools and ask for prose. Beyond the
+                        # budget this just prevents an endless tool loop; after
+                        # a round it also switches the client back to the
+                        # model's own chat template, because the tool-calling
+                        # handler corrupts a history that contains tool results
+                        # (see ModelSettings.tool_chat_format).
                         specs = ()
                     continue
 
@@ -256,6 +280,58 @@ class NativeAgentRunner:
             return ()
         return tuple(self._registry.specs_for(request.policy))
 
+    async def _invoke_deduplicated(
+        self,
+        request: RunRequest,
+        call: Any,
+        observed: dict[tuple[str, str], ToolResult],
+    ) -> ToolResult:
+        """Run the tool, or replay this turn's answer if it is an exact repeat.
+
+        Only cacheable tools are replayed: anything with a side effect must
+        actually run each time, and a tool that declares itself
+        non-deterministic may legitimately return something different.
+        """
+        key = _call_key(call)
+        cacheable = self._is_cacheable(call.name)
+
+        if cacheable:
+            previous = observed.get(key)
+            if previous is not None:
+                logger.info(
+                    "repeated tool call served from the turn cache",
+                    extra={
+                        "tenant_id": request.context.tenant_id,
+                        "tool": call.name,
+                    },
+                )
+                return ToolResult(
+                    call_id=call.id,
+                    name=previous.name,
+                    content=REPEAT_NOTICE + previous.content,
+                    is_error=previous.is_error,
+                    duration_ms=0.0,
+                )
+
+        result = await self._invoke(request, call)
+        # Errors are not cached: a denial or a timeout may not recur, and
+        # replaying one would hide a tool that started working.
+        if cacheable and not result.is_error:
+            observed[key] = result
+        return result
+
+    def _is_cacheable(self, name: str) -> bool:
+        if self._registry is None:
+            return False
+        try:
+            definition = self._registry.get(name).definition
+        except Exception:
+            return False  # Hallucinated name; the executor will reject it.
+        return (
+            definition.deterministic
+            and definition.side_effect is SideEffect.READ_ONLY
+        )
+
     async def _invoke(self, request: RunRequest, call: Any) -> Any:
         return await self._executor.execute(
             invocation=ToolInvocation(
@@ -267,6 +343,15 @@ class NativeAgentRunner:
             ),
             policy=request.policy,
         )
+
+
+def _call_key(call: Any) -> tuple[str, str]:
+    """Identity of a tool call: the name plus order-independent arguments."""
+    try:
+        arguments = json.dumps(call.arguments, sort_keys=True, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        arguments = repr(call.arguments)
+    return call.name, arguments
 
 
 def _to_chat(message: Message) -> ChatMessage:

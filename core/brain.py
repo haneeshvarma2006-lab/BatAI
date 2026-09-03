@@ -159,6 +159,7 @@ class CognitiveBrain:
             policy=self.policy,
             max_steps=self.settings.agent.max_steps,
             deadline_s=self.settings.agent.deadline_s,
+            tool_rounds_per_turn=self.settings.agent.tool_rounds_per_turn,
             stream_tokens=False,
         )
 
@@ -183,6 +184,7 @@ class CognitiveBrain:
             policy=self.policy,
             max_steps=self.settings.agent.max_steps,
             deadline_s=self.settings.agent.deadline_s,
+            tool_rounds_per_turn=self.settings.agent.tool_rounds_per_turn,
             stream_tokens=True,
         )
         collected: list[str] = []

@@ -31,7 +31,7 @@ from bat.ports.tools import (
     ToolInvocation,
     ToolPolicy,
 )
-from bat.services.agent.loop import NativeAgentRunner
+from bat.services.agent.loop import REPEAT_NOTICE, NativeAgentRunner
 from bat.services.agent.tools import (
     InMemoryToolRegistry,
     PolicyToolExecutor,
@@ -491,9 +491,9 @@ class TestNativeAgentRunner(unittest.TestCase):
                 Completion(
                     content="",
                     tool_calls=(ToolCall(id="c1", name="echo", arguments={"text": "hi"}),),
-                ),
-                Completion(content="The tool said hi."),
-            ]
+                )
+            ],
+            stream_text="The tool said hi.",
         )
         runner = NativeAgentRunner(
             llm=llm, registry=registry, executor=PolicyToolExecutor(registry)
@@ -512,7 +512,45 @@ class TestNativeAgentRunner(unittest.TestCase):
         results = [e for e in events if isinstance(e, ToolResultEvent)]
         self.assertEqual(results[0].content, "echo: hi")
         finals = [e for e in events if isinstance(e, FinalEvent)]
-        self.assertEqual(finals[0].content, "The tool said hi.")
+        self.assertIn("The tool said hi.", finals[0].content)
+
+    def test_synthesis_turn_drops_the_tools(self) -> None:
+        """The whole point of tool_rounds_per_turn.
+
+        llama.cpp's tool-calling handlers corrupt a history that already holds
+        tool results, so the turn that writes the answer must not advertise
+        tools -- that is what selects the model's own chat template.
+        """
+        from bat.domain.conversation import ToolCall
+
+        registry = InMemoryToolRegistry([EchoTool()])
+        llm = ScriptedLLM(
+            [
+                Completion(
+                    content="",
+                    tool_calls=(ToolCall(id="c1", name="echo", arguments={"text": "hi"}),),
+                )
+            ],
+            stream_text="done",
+        )
+        runner = NativeAgentRunner(
+            llm=llm, registry=registry, executor=PolicyToolExecutor(registry)
+        )
+        run(
+            self.drain(
+                runner,
+                self.request(
+                    policy=ToolPolicy(
+                        allowed=frozenset({"echo"}), max_authority=Authority.PURE
+                    )
+                ),
+            )
+        )
+        self.assertEqual(len(llm.calls), 2, "one tool turn, then one synthesis turn")
+        self.assertTrue(llm.calls[0]["tools"], "the first turn should offer tools")
+        self.assertEqual(
+            llm.calls[1]["tools"], [], "the synthesis turn must offer none"
+        )
 
     def test_no_tools_are_offered_when_the_policy_is_empty(self) -> None:
         registry = InMemoryToolRegistry([EchoTool()])
@@ -522,6 +560,153 @@ class TestNativeAgentRunner(unittest.TestCase):
         )
         run(self.drain(runner, self.request()))
         self.assertEqual(llm.calls[-1]["tools"], [])
+
+
+    def test_repeated_identical_tool_call_is_served_from_cache(self) -> None:
+        """Small models re-request a tool instead of using the answer.
+
+        Re-running wastes a step and teaches nothing -- the same result comes
+        back and the model repeats again. The cached reply says so explicitly.
+        """
+        from bat.domain.conversation import ToolCall
+
+        class CountingEcho(EchoTool):
+            runs = 0
+
+            async def run(self, invocation):
+                type(self).runs += 1
+                return f"echo: {invocation.arguments['text']}"
+
+        tool = CountingEcho()
+        registry = InMemoryToolRegistry([tool])
+        repeat = ToolCall(id="c1", name="echo", arguments={"text": "hi"})
+        llm = ScriptedLLM(
+            [
+                Completion(content="", tool_calls=(repeat,)),
+                Completion(
+                    content="",
+                    tool_calls=(ToolCall(id="c2", name="echo", arguments={"text": "hi"}),),
+                ),
+                Completion(content="Done."),
+            ]
+        )
+        runner = NativeAgentRunner(
+            llm=llm, registry=registry, executor=PolicyToolExecutor(registry)
+        )
+        events = run(
+            self.drain(
+                runner,
+                self.request(
+                    policy=ToolPolicy(
+                        allowed=frozenset({"echo"}),
+                        max_authority=Authority.PURE,
+                        max_calls_per_run=4,
+                    ),
+                    tool_rounds_per_turn=3,
+                ),
+            )
+        )
+        results = [e for e in events if isinstance(e, ToolResultEvent)]
+        self.assertEqual(len(results), 2, "both calls should produce an observation")
+        self.assertEqual(CountingEcho.runs, 1, "the tool should execute only once")
+        self.assertNotIn(REPEAT_NOTICE, results[0].content)
+        self.assertIn(REPEAT_NOTICE, results[1].content)
+        self.assertIn("echo: hi", results[1].content)
+
+    def test_different_arguments_are_not_deduplicated(self) -> None:
+        from bat.domain.conversation import ToolCall
+
+        class CountingEcho(EchoTool):
+            runs = 0
+
+            async def run(self, invocation):
+                type(self).runs += 1
+                return f"echo: {invocation.arguments['text']}"
+
+        registry = InMemoryToolRegistry([CountingEcho()])
+        llm = ScriptedLLM(
+            [
+                Completion(
+                    content="",
+                    tool_calls=(
+                        ToolCall(id="a", name="echo", arguments={"text": "one"}),
+                        ToolCall(id="b", name="echo", arguments={"text": "two"}),
+                    ),
+                ),
+                Completion(content="Done."),
+            ]
+        )
+        runner = NativeAgentRunner(
+            llm=llm, registry=registry, executor=PolicyToolExecutor(registry)
+        )
+        run(
+            self.drain(
+                runner,
+                self.request(
+                    policy=ToolPolicy(
+                        allowed=frozenset({"echo"}),
+                        max_authority=Authority.PURE,
+                        max_calls_per_run=4,
+                    ),
+                    tool_rounds_per_turn=3,
+                ),
+            )
+        )
+        self.assertEqual(CountingEcho.runs, 2, "distinct arguments must both run")
+
+    def test_argument_order_does_not_defeat_the_cache(self) -> None:
+        from bat.services.agent.loop import _call_key
+        from bat.domain.conversation import ToolCall
+
+        first = ToolCall(id="a", name="t", arguments={"x": 1, "y": 2})
+        second = ToolCall(id="b", name="t", arguments={"y": 2, "x": 1})
+        self.assertEqual(_call_key(first), _call_key(second))
+
+    def test_non_deterministic_tools_are_never_cached(self) -> None:
+        """A clock or live feed must actually run again."""
+        from bat.ports.tools import ToolDefinition
+        from bat.domain.conversation import ToolCall
+
+        class Clock:
+            runs = 0
+            definition = ToolDefinition(
+                name="clock",
+                description="Current time.",
+                parameters={"type": "object", "properties": {}},
+                authority=Authority.PURE,
+                isolation=Isolation.IN_PROCESS,
+                deterministic=False,
+            )
+
+            async def run(self, invocation):
+                type(self).runs += 1
+                return f"tick {type(self).runs}"
+
+        registry = InMemoryToolRegistry([Clock()])
+        llm = ScriptedLLM(
+            [
+                Completion(content="", tool_calls=(ToolCall(id="a", name="clock", arguments={}),)),
+                Completion(content="", tool_calls=(ToolCall(id="b", name="clock", arguments={}),)),
+                Completion(content="Done."),
+            ]
+        )
+        runner = NativeAgentRunner(
+            llm=llm, registry=registry, executor=PolicyToolExecutor(registry)
+        )
+        run(
+            self.drain(
+                runner,
+                self.request(
+                    policy=ToolPolicy(
+                        allowed=frozenset({"clock"}),
+                        max_authority=Authority.PURE,
+                        max_calls_per_run=4,
+                    ),
+                    tool_rounds_per_turn=3,
+                ),
+            )
+        )
+        self.assertEqual(Clock.runs, 2, "a non-deterministic tool must re-run")
 
     def test_llm_failure_produces_a_single_error_event(self) -> None:
         class BrokenLLM:

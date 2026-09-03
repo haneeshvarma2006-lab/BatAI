@@ -85,11 +85,22 @@ class ModelSettings(BaseModel):
     #: Generation threads. None lets llama.cpp pick from the CPU count.
     n_threads: int | None = Field(default=None, gt=0)
     n_batch: int = Field(default=512, gt=0)
-    #: Chat template. None uses the template embedded in the .gguf metadata --
-    #: which for most models means tool calls arrive as plain text and the agent
-    #: loop never sees them. Set "chatml-function-calling" for ChatML models
-    #: (Qwen, and others) to get structured tool calls.
+    #: Chat template for ordinary generation. None uses the one embedded in
+    #: the .gguf metadata, which is normally what you want.
     chat_format: str | None = None
+    #: Chat template used *only* on a turn where tools are advertised.
+    #:
+    #: These are separate because no single value works for both. Under a
+    #: model's own template, tool calls come back as plain text and the agent
+    #: loop never sees them. Under "chatml-function-calling" they parse
+    #: correctly -- but that handler then mangles the tool-result history when
+    #: it renders the follow-up, and the model answers with an invented number
+    #: instead of the one the tool returned. Measured on Qwen2.5-3B: the tool
+    #: computed 1280 and the reply said 1160.
+    #:
+    #: So the tool-calling handler is used for the turn that may emit a call,
+    #: and the model's own template for the turn that produces prose.
+    tool_chat_format: str | None = "chatml-function-calling"
     seed: int | None = None
     use_mmap: bool = True
     use_mlock: bool = False
@@ -240,6 +251,19 @@ class AgentSettings(BaseModel):
     max_steps: int = Field(default=6, gt=0, le=32)
     deadline_s: float = Field(default=120.0, gt=0)
     max_tool_calls_per_run: int = Field(default=8, gt=0)
+    #: How many rounds of tool calls the model gets before the loop stops
+    #: offering tools and asks for a plain answer.
+    #:
+    #: Defaults to 1 because llama.cpp's tool-calling chat handlers rewrite the
+    #: conversation when they render a prompt, and a history that already
+    #: contains tool results comes back mangled -- the model then answers with
+    #: a number the tool never returned. Measured on Qwen2.5-3B: the calculator
+    #: returned 1280 and the reply said 1160. Synthesising the answer without
+    #: the tool handler avoids that entirely.
+    #:
+    #: Raise it only for a model and handler you have actually verified keep
+    #: tool results intact across rounds.
+    tool_rounds_per_turn: int = Field(default=1, gt=0)
     #: Ceiling on what a tool may reach. HOST is refused in production: a tool
     #: with host reach on shared infrastructure turns prompt injection into
     #: remote code execution.

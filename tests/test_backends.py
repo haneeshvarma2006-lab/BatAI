@@ -61,7 +61,11 @@ class TestRedisTokenBucket(unittest.TestCase):
         run(self.limiter().verify())
 
     def test_burst_is_enforced(self) -> None:
-        limiter = self.limiter()
+        # A fast refill rate makes this flaky: at 100/s a token returns every
+        # 10ms, so a slow machine refills one mid-test and the fourth acquire
+        # succeeds. The rate is irrelevant to what is being asserted, so pin it
+        # low enough that refill cannot happen within the test.
+        limiter = self.limiter(rate_per_second=0.01, burst=3)
 
         async def scenario():
             for _ in range(3):
@@ -73,7 +77,7 @@ class TestRedisTokenBucket(unittest.TestCase):
         self.assertGreater(caught.exception.retry_after_seconds, 0)
 
     def test_limit_is_per_tenant(self) -> None:
-        limiter = self.limiter()
+        limiter = self.limiter(rate_per_second=0.01, burst=3)
 
         async def scenario():
             for _ in range(3):

@@ -277,8 +277,18 @@ class LlamaCppClient:
             kwargs["tools"] = [_tool_to_wire(t) for t in tools]
             kwargs["tool_choice"] = "auto"
 
+        # Only a turn that advertises tools uses the tool-calling template; see
+        # ModelSettings.tool_chat_format for why one template cannot do both.
+        chat_format = (
+            self._settings.tool_chat_format if tools else self._settings.chat_format
+        )
+
         raw = await self._run(
-            lambda llama: llama.create_chat_completion(messages=payload, **kwargs),
+            lambda llama: _with_chat_format(
+                llama,
+                chat_format,
+                lambda: llama.create_chat_completion(messages=payload, **kwargs),
+            ),
             timeout_s=timeout_s or self._settings.request_timeout_s,
         )
         return _parse_completion(raw)
@@ -312,11 +322,21 @@ class LlamaCppClient:
         # rather than generating into a queue nobody is reading.
         cancel = threading.Event()
 
+        base_format = self._settings.chat_format
+
         def produce(llama: Any) -> None:
             try:
-                for chunk in llama.create_chat_completion(
-                    messages=payload, stream=True, **kwargs
-                ):
+                # Pinned explicitly rather than relying on whatever the last
+                # call left behind: streaming never advertises tools, so it must
+                # use the model's own template.
+                stream = _with_chat_format(
+                    llama,
+                    base_format,
+                    lambda: llama.create_chat_completion(
+                        messages=payload, stream=True, **kwargs
+                    ),
+                )
+                for chunk in stream:
                     if cancel.is_set():
                         break
                     delta = _extract_delta(chunk)
@@ -407,6 +427,27 @@ class LlamaCppClient:
 
 
 # -- wire helpers ----------------------------------------------------------
+
+
+def _with_chat_format(llama: Any, chat_format: str | None, call: Any) -> Any:
+    """Run ``call`` with ``llama.chat_format`` temporarily set.
+
+    llama-cpp-python resolves the chat handler from ``self.chat_format`` at call
+    time, so swapping the attribute is enough and no second model instance is
+    needed. Safe despite being shared mutable state: every call to this client
+    is serialised onto one worker thread, so no two swaps can overlap. The
+    original value is always restored.
+    """
+    if chat_format is None:
+        return call()
+    previous = getattr(llama, "chat_format", None)
+    if previous == chat_format:
+        return call()
+    llama.chat_format = chat_format
+    try:
+        return call()
+    finally:
+        llama.chat_format = previous
 
 
 def _to_wire(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:

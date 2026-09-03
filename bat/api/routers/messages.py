@@ -104,6 +104,7 @@ async def _prepare(
         policy=_policy_for(settings),
         max_steps=settings.agent.max_steps,
         deadline_s=settings.agent.deadline_s,
+        tool_rounds_per_turn=settings.agent.tool_rounds_per_turn,
     )
     return session, user_message, run_request
 
