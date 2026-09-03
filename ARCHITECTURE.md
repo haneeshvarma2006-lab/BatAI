@@ -153,8 +153,12 @@ in the logs, keyed by request id.
 
 **Limits.** Per-tenant token bucket on request rate; a separate per-tenant
 concurrency cap on agent runs, because one run can hold a model slot for a
-minute and fifty of them starve the box. Both are per-process today — for a
-hard global limit they move behind Redis with no change to call sites.
+minute and fifty of them starve the box. Both have in-process and Redis
+implementations behind one interface; production requires Redis, since a
+per-process limit is really `replicas x configured`. The Redis versions are
+single Lua scripts (a client-side read-modify-write leaks the limit under
+exactly the load it exists to control), and run slots are expiring leases rather
+than a counter, so a crashed worker's slot returns on its own.
 
 ---
 
@@ -333,7 +337,7 @@ in-memory sessions or vectors, or tool isolation below `SUBPROCESS`.
 | 4 | RAG pipeline + Chroma / in-memory vector stores | 1, 3 | **done** |
 | 5 | Tool registry + policy executor | 1 | **done** |
 | 6 | Agent loop replacing `ReferenceAgentRunner` | 2, 4, 5 | **done** |
-| 7 | `PostgresSessionStore`, `RedisRateLimiter` | 1 | next |
+| 7 | `PostgresSessionStore`, `RedisRateLimiter` | 1 | **done** |
 | 8 | Sandboxed tool runtime, then re-register tools | 5 | next |
 | 9 | Billing, usage metering, admin API | 1–8 | later |
 

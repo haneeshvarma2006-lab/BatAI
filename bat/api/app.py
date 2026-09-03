@@ -22,7 +22,13 @@ from bat import __version__
 from bat.adapters.agent_reference import ReferenceAgentRunner
 from bat.adapters.llama_cpp_client import LlamaCppClient
 from bat.adapters.llama_cpp_embedder import HashingEmbedder, LlamaCppEmbedder
+from bat.adapters.ratelimit_redis import (
+    RedisConcurrencyLimiter,
+    RedisTokenBucketLimiter,
+    create_redis_client,
+)
 from bat.adapters.session_store_memory import InMemorySessionStore
+from bat.adapters.session_store_postgres import PostgresSessionStore
 from bat.adapters.vector_chroma import ChromaVectorStore
 from bat.adapters.vector_memory import InMemoryVectorStore
 from bat.services.agent.loop import NativeAgentRunner
@@ -54,19 +60,70 @@ tenant return 404, not 403.
 def build_session_store(settings: Settings) -> SessionStore:
     """Select the session backend.
 
-    Only the in-memory backend exists today. `Settings._harden` already refuses
-    to boot production with it, so this raises rather than silently degrading
-    to a backend that loses data.
+    Raises rather than silently degrading: a config asking for Postgres that
+    quietly got an in-memory store would lose every session on restart while
+    looking healthy.
     """
+    ttl = timedelta(seconds=settings.session.ttl_seconds)
     if settings.session.backend == "memory":
         return InMemorySessionStore(
-            ttl=timedelta(seconds=settings.session.ttl_seconds),
+            ttl=ttl,
             max_sessions_per_principal=settings.session.max_sessions_per_principal,
+        )
+    if settings.session.backend == "postgres":
+        if settings.session.dsn is None:  # pragma: no cover - settings validate
+            raise RuntimeError("session.dsn is required for the postgres backend")
+        return PostgresSessionStore(
+            settings.session.dsn.get_secret_value(),
+            ttl=ttl,
+            max_sessions_per_principal=settings.session.max_sessions_per_principal,
+            pool_size=settings.session.pool_size,
         )
     raise NotImplementedError(
         f"session backend {settings.session.backend!r} is configured but its "
         "adapter is not implemented yet"
     )
+
+
+async def build_limiters(settings: Settings) -> tuple[Any, Any, Any]:
+    """Return ``(rate_limiter, run_limiter, redis_client)``.
+
+    The Redis pair verify their Lua at startup. Without that, a Redis without
+    scripting fails on every call and `fail_open` swallows it, so the limiter
+    silently stops limiting while every health check stays green.
+    """
+    cfg = settings.rate_limit
+    if not cfg.enabled:
+        return None, ConcurrencyLimiter(limit=cfg.max_concurrent_runs), None
+
+    if cfg.backend == "memory":
+        return (
+            TokenBucketLimiter(
+                rate_per_second=cfg.requests_per_second, burst=cfg.burst
+            ),
+            ConcurrencyLimiter(limit=cfg.max_concurrent_runs),
+            None,
+        )
+
+    if cfg.dsn is None:  # pragma: no cover - settings validate this
+        raise RuntimeError("rate_limit.dsn is required for the redis backend")
+    client = await create_redis_client(cfg.dsn.get_secret_value())
+    rate = RedisTokenBucketLimiter(
+        client,
+        rate_per_second=cfg.requests_per_second,
+        burst=cfg.burst,
+        fail_open=cfg.fail_open,
+    )
+    runs = RedisConcurrencyLimiter(
+        client,
+        limit=cfg.max_concurrent_runs,
+        lease_ttl_s=cfg.lease_ttl_s,
+        fail_open=cfg.fail_open,
+    )
+    await rate.verify()
+    await runs.verify()
+    logger.info("redis limiters ready", extra={"fail_open": cfg.fail_open})
+    return rate, runs, client
 
 
 
@@ -159,22 +216,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.agent_runner = build_agent_runner(
             settings, app.state.llm, app.state.memory
         )
-        app.state.run_limiter = ConcurrencyLimiter(
-            limit=settings.rate_limit.max_concurrent_runs
-        )
-        app.state.rate_limiter = (
-            TokenBucketLimiter(
-                rate_per_second=settings.rate_limit.requests_per_second,
-                burst=settings.rate_limit.burst,
-            )
-            if settings.rate_limit.enabled
-            else None
-        )
+        rate_limiter, run_limiter, redis_client = await build_limiters(settings)
+        app.state.rate_limiter = rate_limiter
+        app.state.run_limiter = run_limiter
+        app.state.redis = redis_client
 
         if not settings.api_keys:
             logger.warning(
                 "no API keys configured; every request will be rejected with 401"
             )
+
+        connect = getattr(app.state.session_store, "connect", None)
+        if connect is not None:
+            # Postgres opens its pool and applies the schema here, so a bad DSN
+            # fails at boot rather than on a user's first request.
+            await connect()
 
         if app.state.llm is not None and settings.model.preload:
             # Load before serving: the first request would otherwise block for
@@ -194,6 +250,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "version": __version__,
                 "environment": str(settings.environment),
                 "session_backend": settings.session.backend,
+                "rate_limit_backend": settings.rate_limit.backend,
                 "model": settings.model.name if settings.model.is_configured else None,
                 "vector_mode": settings.vector.mode,
                 "enabled_tools": sorted(settings.agent.enabled_tools),
@@ -206,7 +263,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             purge_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await purge_task
-            for resource in (app.state.llm, embedder):
+            for resource in (
+                app.state.llm,
+                embedder,
+                app.state.session_store,
+                redis_client,
+            ):
                 closer = getattr(resource, "close", None)
                 if closer is not None:
                     with contextlib.suppress(Exception):

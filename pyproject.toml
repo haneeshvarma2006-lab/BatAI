@@ -16,8 +16,10 @@ dependencies = [
 # Python 3.12 has prebuilt wheels, which is the supported path.
 model = ["llama-cpp-python>=0.3.0"]
 rag = ["chromadb>=1.0", "pypdf>=5.0"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "mypy>=1.11", "ruff>=0.6"]
-all = ["bat-platform[model,rag]"]
+postgres = ["asyncpg>=0.30"]
+redis = ["redis>=5.0"]
+dev = ["pytest>=8.0", "mypy>=1.11", "ruff>=0.6", "fakeredis[lua]>=2.20"]
+all = ["bat-platform[model,rag,postgres,redis]"]
 
 [project.scripts]
 bat = "bat.cli:main"

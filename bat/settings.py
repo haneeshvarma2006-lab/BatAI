@@ -196,11 +196,26 @@ class SessionSettings(BaseModel):
             raise ValueError(f"session.dsn is required for backend={self.backend!r}")
         return self
 
+    @property
+    def pool_size(self) -> int:
+        return 10
+
 
 class RateLimitSettings(BaseModel):
     model_config = {"frozen": True}
 
     enabled: bool = True
+    #: ``memory`` is per-process, so the effective limit is replicas x
+    #: configured. ``redis`` makes it global; production requires it.
+    backend: Literal["memory", "redis"] = "memory"
+    dsn: SecretStr | None = None
+    #: On a Redis outage, allow requests rather than 503 the API. The right
+    #: trade when the limiter protects capacity; set False when it is a
+    #: billing or abuse control and over-admitting is worse than rejecting.
+    fail_open: bool = True
+    #: Lease lifetime for a run slot. Must exceed agent.deadline_s, or a live
+    #: run's lease expires and the tenant exceeds its ceiling.
+    lease_ttl_s: float = Field(default=300.0, gt=0)
     #: Sustained requests per second per tenant.
     requests_per_second: float = Field(default=5.0, gt=0)
     #: Burst allowance above the sustained rate.
@@ -208,6 +223,12 @@ class RateLimitSettings(BaseModel):
     #: Concurrent agent runs per tenant. Agent turns are expensive, so they are
     #: capped separately from cheap CRUD calls.
     max_concurrent_runs: int = Field(default=4, gt=0)
+
+    @model_validator(mode="after")
+    def _check_dsn(self) -> RateLimitSettings:
+        if self.backend == "redis" and self.dsn is None:
+            raise ValueError("rate_limit.dsn is required for backend='redis'")
+        return self
 
 
 class AgentSettings(BaseModel):
@@ -294,6 +315,16 @@ class Settings(BaseSettings):
             problems.append(
                 "session.backend='memory' is per-process; sessions would be lost on "
                 "restart and inconsistent across replicas"
+            )
+        if self.rate_limit.enabled and self.rate_limit.backend == "memory":
+            problems.append(
+                "rate_limit.backend='memory' is per-process; the effective limit "
+                "becomes replicas x configured and moves when the cluster scales"
+            )
+        if self.rate_limit.lease_ttl_s <= self.agent.deadline_s:
+            problems.append(
+                "rate_limit.lease_ttl_s must exceed agent.deadline_s, or a live "
+                "run's slot is released while it is still running"
             )
         if self.agent.max_tool_authority >= Authority.HOST:
             problems.append(

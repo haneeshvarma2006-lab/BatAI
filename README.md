@@ -16,7 +16,7 @@ Full design rationale lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | Area | State |
 | --- | --- |
 | Tenancy, auth, scopes | **implemented** |
-| Session + transcript store | **implemented** (in-memory adapter; Postgres pending) |
+| Session + transcript store | **implemented** (in-memory + Postgres) |
 | HTTP API, SSE streaming, rate limits | **implemented** |
 | Native `llama-cpp-python` inference | **implemented** — untested against real weights, see below |
 | Local `.gguf` embeddings | **implemented** |
@@ -24,11 +24,12 @@ Full design rationale lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | Vector stores (in-memory + Chroma) | **implemented** |
 | Agent loop + policy-gated tool executor | **implemented** |
 | Built-in tools + subprocess sandbox | **implemented** |
-| Postgres sessions, Redis limits | pending |
+| Global rate limits + run leases (Redis) | **implemented** |
 | Container-isolated code execution | pending — `python_exec` is desktop-only |
 
-99 tests pass, covering tenant isolation, auth, scopes, limits, streaming,
-chunking, retrieval, sandbox containment, tool policy and the agent loop.
+131 tests pass, covering tenant isolation, auth, scopes, limits, streaming,
+chunking, retrieval, sandbox containment, tool policy, the agent loop and the
+Redis limiters (against real Lua execution).
 
 **The inference path has not been run against a real model.** It is verified
 against a fake that reproduces llama.cpp's awkward properties — blocking calls
@@ -245,6 +246,42 @@ streaming — rather than line count.
 
 ---
 
+## Durable backends
+
+`BAT_SESSION__BACKEND=postgres` and `BAT_RATE_LIMIT__BACKEND=redis` replace the
+per-process defaults. Both are required in production, and `Settings._harden`
+says why: in-memory sessions vanish on restart and differ per replica, and an
+in-process rate limit becomes `replicas x configured` — a limit that moves
+whenever the cluster autoscales.
+
+**Postgres.** Composite `(tenant_id, id)` primary keys, so a query that forgets
+the tenant misses the index rather than returning another tenant's rows.
+`message_count` is incremented in SQL, never read-modify-written. The session
+quota is checked *inside* the `INSERT ... SELECT`, so two concurrent creates
+cannot both pass a separate check. Deleting a session takes its transcript with
+it via `ON DELETE CASCADE`. The schema is applied on connect, and `SCHEMA_RLS`
+documents how to add row-level security on top.
+
+**Redis.** Both operations are single Lua scripts, because a client-side
+read-modify-write is a lost-update race — and the race favours the tenant, so
+the limit leaks precisely when it is under most pressure.
+
+Run slots are **leases in a sorted set, not a counter.** A counter is released
+by a `finally` block, which never runs if the holder is OOM-killed or evicted;
+that would permanently shrink a tenant's capacity with no recovery short of
+manual intervention. A lease expires on its own, so a crashed worker's slot
+comes back. Keep `lease_ttl_s` above `agent.deadline_s` — the config guard
+enforces it.
+
+`fail_open` decides what a Redis outage costs: availability or limiting. It
+defaults to allowing requests, which is right when the limiter protects
+capacity, and should be `false` where it is an abuse or billing control.
+Independently of that, both limiters run their script once at startup —
+without it, a Redis lacking scripting fails every call, `fail_open` swallows it,
+and the limiter silently stops limiting while every health check stays green.
+
+---
+
 ## Running real inference
 
 Point the config at a `.gguf` and restart — no code change:
@@ -305,7 +342,7 @@ behind `LLMClient`, so it is an adapter swap and nothing above it changes.
 | 3 | RAG pipeline, local embeddings, vector stores | **done** |
 | 4 | Agent loop + tool executor | **done** |
 | 5 | Built-in tools + subprocess sandbox | **done** |
-| 6 | `PostgresSessionStore`, Redis-backed limits | next |
+| 6 | `PostgresSessionStore`, Redis limits and run leases | **done** (Postgres SQL unrun) |
 | 7 | Container runtime, so `python_exec` can ship | next |
 | 8 | Network tools (HTTP fetch, web search) with an egress allowlist | next |
 | 9 | Billing, usage metering, admin API | later |
