@@ -28,6 +28,7 @@ from bat.adapters.vector_memory import InMemoryVectorStore
 from bat.services.agent.loop import NativeAgentRunner
 from bat.services.agent.tools import InMemoryToolRegistry, PolicyToolExecutor
 from bat.services.rag.pipeline import LocalMemoryPipeline
+from bat.tools.builtin import build_default_tools
 from bat.api.errors import install_error_handlers
 from bat.api.middleware import BodySizeLimitMiddleware, CorrelationMiddleware
 from bat.api.routers import health, memory, messages, sessions
@@ -105,7 +106,11 @@ def build_agent_runner(settings: Settings, llm: Any, memory: Any) -> Any:
         )
         return ReferenceAgentRunner()
 
-    registry = InMemoryToolRegistry()
+    # Everything is registered; the per-tenant policy decides what is
+    # reachable. A tool the policy refuses is never advertised to the model.
+    registry = InMemoryToolRegistry(
+        build_default_tools(memory=memory, vector_settings=settings.vector)
+    )
     return NativeAgentRunner(
         llm=llm,
         memory=memory,
@@ -191,6 +196,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "session_backend": settings.session.backend,
                 "model": settings.model.name if settings.model.is_configured else None,
                 "vector_mode": settings.vector.mode,
+                "enabled_tools": sorted(settings.agent.enabled_tools),
                 "tenants_configured": len({k.tenant_id for k in settings.api_keys}),
             },
         )

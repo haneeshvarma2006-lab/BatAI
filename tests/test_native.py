@@ -24,6 +24,7 @@ from bat.ports.agent import ErrorEvent, FinalEvent, StopReason, TokenEvent, Tool
 from bat.ports.llm import Completion, ToolSpec
 from bat.ports.retrieval import MemoryKind, RetrievalQuery, tenant_namespace
 from bat.ports.tools import (
+    Authority,
     Isolation,
     SideEffect,
     ToolDefinition,
@@ -308,7 +309,8 @@ class EchoTool:
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
         },
-        isolation=Isolation.PURE,
+        authority=Authority.PURE,
+        isolation=Isolation.IN_PROCESS,
         side_effect=SideEffect.READ_ONLY,
         required_scopes=frozenset({Scope.TOOLS_EXECUTE}),
     )
@@ -324,7 +326,8 @@ class HostTool(EchoTool):
         name="host",
         description="Touches the host.",
         parameters={"type": "object", "properties": {}},
-        isolation=Isolation.NONE,
+        authority=Authority.HOST,
+        isolation=Isolation.IN_PROCESS,
         side_effect=SideEffect.EXTERNAL_WRITE,
     )
 
@@ -345,7 +348,7 @@ class TestToolExecutor(unittest.TestCase):
         )
 
     def test_allowed_tool_runs(self) -> None:
-        policy = ToolPolicy(allowed=frozenset({"echo"}), min_isolation=Isolation.PURE)
+        policy = ToolPolicy(allowed=frozenset({"echo"}), max_authority=Authority.PURE)
         result = run(
             self.executor.execute(invocation=self.invoke("echo", {"text": "hi"}), policy=policy)
         )
@@ -354,31 +357,31 @@ class TestToolExecutor(unittest.TestCase):
 
     def test_unlisted_tool_is_denied(self) -> None:
         """Default deny: registration is not authorization."""
-        policy = ToolPolicy(allowed=frozenset(), min_isolation=Isolation.PURE)
+        policy = ToolPolicy(allowed=frozenset(), max_authority=Authority.PURE)
         result = run(
             self.executor.execute(invocation=self.invoke("echo", {"text": "hi"}), policy=policy)
         )
         self.assertTrue(result.is_error)
         self.assertIn("not enabled", result.content)
 
-    def test_isolation_floor_refuses_host_tools(self) -> None:
+    def test_authority_ceiling_refuses_host_tools(self) -> None:
         policy = ToolPolicy(
             allowed=frozenset({"host"}),
-            min_isolation=Isolation.SUBPROCESS,
+            max_authority=Authority.NETWORK,
             allowed_side_effects=frozenset(SideEffect),
         )
         result = run(self.executor.execute(invocation=self.invoke("host", {}), policy=policy))
         self.assertTrue(result.is_error)
-        self.assertIn("isolation", result.content)
+        self.assertIn("HOST authority", result.content)
 
     def test_hallucinated_tool_name_is_an_observation(self) -> None:
-        policy = ToolPolicy(allowed=frozenset({"echo"}), min_isolation=Isolation.PURE)
+        policy = ToolPolicy(allowed=frozenset({"echo"}), max_authority=Authority.PURE)
         result = run(self.executor.execute(invocation=self.invoke("nope", {}), policy=policy))
         self.assertTrue(result.is_error)
         self.assertIn("not registered", result.content)
 
     def test_bad_arguments_are_rejected_before_the_tool_runs(self) -> None:
-        policy = ToolPolicy(allowed=frozenset({"echo"}), min_isolation=Isolation.PURE)
+        policy = ToolPolicy(allowed=frozenset({"echo"}), max_authority=Authority.PURE)
         result = run(
             self.executor.execute(invocation=self.invoke("echo", {"text": 42}), policy=policy)
         )
@@ -387,7 +390,7 @@ class TestToolExecutor(unittest.TestCase):
 
     def test_missing_scope_is_refused(self) -> None:
         self.context = make_context(scopes=frozenset({Scope.SESSIONS_READ}))
-        policy = ToolPolicy(allowed=frozenset({"echo"}), min_isolation=Isolation.PURE)
+        policy = ToolPolicy(allowed=frozenset({"echo"}), max_authority=Authority.PURE)
         result = run(
             self.executor.execute(invocation=self.invoke("echo", {"text": "x"}), policy=policy)
         )
@@ -395,7 +398,7 @@ class TestToolExecutor(unittest.TestCase):
         self.assertIn("requires scope", result.content)
 
     def test_registry_advertises_only_permitted_tools(self) -> None:
-        policy = ToolPolicy(allowed=frozenset({"echo"}), min_isolation=Isolation.PURE)
+        policy = ToolPolicy(allowed=frozenset({"echo"}), max_authority=Authority.PURE)
         names = [s.name for s in self.registry.specs_for(policy)]
         self.assertEqual(names, ["echo"])
 
@@ -500,7 +503,7 @@ class TestNativeAgentRunner(unittest.TestCase):
                 runner,
                 self.request(
                     policy=ToolPolicy(
-                        allowed=frozenset({"echo"}), min_isolation=Isolation.PURE
+                        allowed=frozenset({"echo"}), max_authority=Authority.PURE
                     )
                 ),
             )

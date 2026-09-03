@@ -57,7 +57,8 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     print(f"embeddings        {settings.embedding.model_path or 'hashing fallback'}")
     print(f"credentials       {len(settings.api_keys)} key(s), "
           f"{len({k.tenant_id for k in settings.api_keys})} tenant(s)")
-    print(f"tool isolation    >= {settings.agent.min_tool_isolation.name}")
+    print(f"tool authority    <= {settings.agent.max_tool_authority.name}")
+    print(f"code isolation    >= {settings.agent.min_code_isolation.name}")
     print(f"enabled tools     {sorted(settings.agent.enabled_tools) or 'none'}")
 
     warnings: list[str] = []

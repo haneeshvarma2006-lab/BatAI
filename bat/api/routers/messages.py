@@ -62,7 +62,8 @@ def _policy_for(settings: Settings) -> ToolPolicy:
     """
     return ToolPolicy(
         allowed=frozenset(settings.agent.enabled_tools),
-        min_isolation=settings.agent.min_tool_isolation,
+        max_authority=settings.agent.max_tool_authority,
+        min_code_isolation=settings.agent.min_code_isolation,
         max_calls_per_run=settings.agent.max_tool_calls_per_run,
     )
 

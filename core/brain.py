@@ -32,6 +32,7 @@ from bat.ports.tools import DESKTOP_POLICY, ToolPolicy
 from bat.services.agent.loop import NativeAgentRunner
 from bat.services.agent.tools import InMemoryToolRegistry, PolicyToolExecutor
 from bat.services.rag.pipeline import LocalMemoryPipeline
+from bat.tools.builtin import build_default_tools
 from bat.settings import Settings
 
 #: The desktop build is one tenant with one user.
@@ -73,7 +74,8 @@ class CognitiveBrain:
         # *and* named in the policy allowlist.
         self.policy = tool_policy or ToolPolicy(
             allowed=frozenset(self.settings.agent.enabled_tools),
-            min_isolation=DESKTOP_POLICY.min_isolation,
+            max_authority=DESKTOP_POLICY.max_authority,
+            min_code_isolation=DESKTOP_POLICY.min_code_isolation,
             allowed_side_effects=DESKTOP_POLICY.allowed_side_effects,
             max_calls_per_run=self.settings.agent.max_tool_calls_per_run,
         )
@@ -92,7 +94,11 @@ class CognitiveBrain:
         self.memory = LocalMemoryPipeline(
             store=self.vector_store, settings=self.settings.vector
         )
-        registry = InMemoryToolRegistry()
+        registry = InMemoryToolRegistry(
+            build_default_tools(
+                memory=self.memory, vector_settings=self.settings.vector
+            )
+        )
         self.registry = registry
         self.runner = NativeAgentRunner(
             llm=self.llm,

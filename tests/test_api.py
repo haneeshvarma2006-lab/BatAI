@@ -414,7 +414,26 @@ class TestConfigurationSafety(unittest.TestCase):
             Settings(environment="production")
         message = str(caught.exception)
         self.assertIn("unsafe production configuration", message)
-        self.assertIn("min_tool_isolation", message)
+        for problem in ("api_keys", "model.model_path", "vector.mode", "session.backend"):
+            self.assertIn(problem, message)
+
+    def test_production_rejects_host_reaching_tools(self) -> None:
+        """The tool defaults are production-safe, so assert the guard directly."""
+        from bat.ports.tools import Authority, Isolation
+
+        with self.assertRaises(Exception) as caught:
+            Settings(
+                environment="production",
+                agent=AgentSettings(max_tool_authority=Authority.HOST),
+            )
+        self.assertIn("max_tool_authority", str(caught.exception))
+
+        with self.assertRaises(Exception) as caught:
+            Settings(
+                environment="production",
+                agent=AgentSettings(min_code_isolation=Isolation.IN_PROCESS),
+            )
+        self.assertIn("min_code_isolation", str(caught.exception))
 
     def test_api_key_records_store_only_digests(self) -> None:
         plaintext, digest = generate_api_key()

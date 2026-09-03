@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from bat.domain.tenancy import DEFAULT_SCOPES, Scope, validate_tenant_id
-from bat.ports.tools import Isolation
+from bat.ports.tools import Authority, Isolation
 
 
 class Environment(StrEnum):
@@ -216,9 +216,13 @@ class AgentSettings(BaseModel):
     max_steps: int = Field(default=6, gt=0, le=32)
     deadline_s: float = Field(default=120.0, gt=0)
     max_tool_calls_per_run: int = Field(default=8, gt=0)
-    #: Minimum isolation any tool must declare to be runnable. Production
-    #: configs are rejected below SUBPROCESS; see `Settings._harden`.
-    min_tool_isolation: Isolation = Isolation.NETWORK
+    #: Ceiling on what a tool may reach. HOST is refused in production: a tool
+    #: with host reach on shared infrastructure turns prompt injection into
+    #: remote code execution.
+    max_tool_authority: Authority = Authority.NETWORK
+    #: Containment required of tools that run caller-supplied code.
+    min_code_isolation: Isolation = Isolation.SUBPROCESS
+    #: Tools this deployment opts in, by name. Empty means no tools at all.
     enabled_tools: frozenset[str] = frozenset()
 
 
@@ -291,10 +295,17 @@ class Settings(BaseSettings):
                 "session.backend='memory' is per-process; sessions would be lost on "
                 "restart and inconsistent across replicas"
             )
-        if self.agent.min_tool_isolation < Isolation.SUBPROCESS:
+        if self.agent.max_tool_authority >= Authority.HOST:
             problems.append(
-                "agent.min_tool_isolation must be SUBPROCESS or stronger in production; "
-                "in-process tools give a tenant code execution on shared infrastructure"
+                "agent.max_tool_authority must be below HOST in production; a tool "
+                "that can reach the host gives a tenant control of shared "
+                "infrastructure through prompt injection"
+            )
+        if self.agent.min_code_isolation < Isolation.SUBPROCESS:
+            problems.append(
+                "agent.min_code_isolation must be SUBPROCESS or stronger in "
+                "production; running caller-supplied code in the API process is "
+                "arbitrary code execution"
             )
         if problems:
             raise ValueError(

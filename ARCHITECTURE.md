@@ -245,28 +245,38 @@ Bounded by `max_steps`, a wall-clock `deadline_s`, and
 `policy.max_calls_per_run`. Exactly one terminal event is always emitted, even
 on an internal failure — the contract the API layer relies on.
 
-### The tool security model
+### The tool security model (implemented)
 
 This is the part that must not be compromised for convenience.
 
 **Default deny.** A tool is unavailable unless its name is in the tenant's
 allowlist. Registration is not authorization.
 
-**Declared isolation, enforced by deployment.** Every tool states an
-`Isolation` level; the deployment sets a floor and anything below it is refused:
+**Two orthogonal axes.** The first cut of this used a single ordered
+`Isolation` ladder, and it was wrong: it conflated *where a tool's code runs*
+with *what that code can reach*. On one ladder, pure computation ranked below
+network access, so a floor strict enough to exclude ambient host authority also
+excluded a tenant-scoped memory lookup. The floor could be safe or useful, never
+both. They are now separate:
 
-| Level | Meaning | Allowed in SaaS |
+*Authority* — what the tool can reach:
+
+| Level | Reach | Allowed in SaaS |
 | --- | --- | --- |
-| `NONE` | in-process, ambient authority | **no** — desktop build only |
-| `PURE` | in-process, no I/O at all | dev only |
-| `NETWORK` | egress to an allowlist, no local effects | yes |
-| `SUBPROCESS` | separate process, dropped privileges, rlimits | yes |
-| `SANDBOX` | container/microVM per call, no host mounts, no creds | yes |
+| `PURE` | nothing | yes |
+| `TENANT` | the caller's own tenant data | yes |
+| `NETWORK` | vetted egress, no local effects | yes |
+| `HOST` | filesystem, shell, desktop | **never** |
 
-`Settings._harden` **refuses to boot production** below `SUBPROCESS`. That is
-why the existing tools cannot simply be registered: `execute_python_code`,
-`automate_typing`, `search_and_open_file` and `open_application` are all
-`Isolation.NONE`.
+*Isolation* — where its code runs: `IN_PROCESS` → `SUBPROCESS` → `CONTAINER`.
+This floor binds only tools that execute caller-supplied code; a fixed-function
+tool with a validated schema is bounded by its own implementation.
+
+`Settings._harden` **refuses to boot production** with `HOST` authority or with
+code execution below `SUBPROCESS`. That is why `automate_typing`,
+`search_and_open_file` and `open_application` still cannot be registered, and
+why `python_exec` — though now genuinely subprocess-isolated — declares `HOST`
+and is refused server-side.
 
 Their migration path:
 

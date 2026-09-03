@@ -23,11 +23,12 @@ Full design rationale lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | RAG pipeline (chunk → embed → retrieve → budgeted context) | **implemented** |
 | Vector stores (in-memory + Chroma) | **implemented** |
 | Agent loop + policy-gated tool executor | **implemented** |
+| Built-in tools + subprocess sandbox | **implemented** |
 | Postgres sessions, Redis limits | pending |
-| Sandboxed tool runtime | pending — no tool ships enabled |
+| Container-isolated code execution | pending — `python_exec` is desktop-only |
 
-72 tests pass, covering tenant isolation, auth, scopes, limits, streaming,
-chunking, retrieval, tool policy and the agent loop.
+99 tests pass, covering tenant isolation, auth, scopes, limits, streaming,
+chunking, retrieval, sandbox containment, tool policy and the agent loop.
 
 **The inference path has not been run against a real model.** It is verified
 against a fake that reproduces llama.cpp's awkward properties — blocking calls
@@ -157,29 +158,67 @@ Every resource belongs to exactly one tenant, enforced by five rules:
 
 ## Tool security
 
-The agent's tool boundary is **default-deny**. A tool is unavailable unless its
-name is in the tenant's allowlist; registration is not authorization.
+The tool boundary is **default-deny**: a tool is unavailable unless its name is
+in the tenant's allowlist. Registration is not authorization.
 
-Every tool declares an isolation level, and the deployment sets a floor:
+Safety is **two independent axes**, because one ordered ladder cannot express
+both. (An earlier version tried, and the floor could be set safely or usefully
+but never both — a bar strict enough to exclude host access also excluded a
+tenant-scoped memory lookup.)
 
-| Level | Meaning | Allowed in the hosted product |
+**Authority — what the tool can reach:**
+
+| | Reach | Allowed on a shared deployment |
 | --- | --- | --- |
-| `NONE` | in-process, ambient authority | **no** — desktop build only |
-| `PURE` | in-process, no I/O | dev only |
-| `NETWORK` | egress to an allowlist | yes |
-| `SUBPROCESS` | separate process, dropped privileges, rlimits | yes |
-| `SANDBOX` | container/microVM per call | yes |
+| `PURE` | nothing; pure computation | yes |
+| `TENANT` | the caller's own tenant data only | yes |
+| `NETWORK` | vetted outbound egress | yes |
+| `HOST` | filesystem, shell, desktop | **never** |
 
-`Settings._harden` **refuses to boot production** below `SUBPROCESS`.
+**Isolation — where its code runs:** `IN_PROCESS` → `SUBPROCESS` → `CONTAINER`.
+This floor applies only to tools that run *caller-supplied code*; a
+fixed-function tool with a validated schema is bounded by its own
+implementation.
 
-This is why the legacy tools in `tools/` cannot be registered as they stand.
-`execute_python_code` calls `exec()` with full `__builtins__` (arbitrary RCE);
-`automate_typing` drives the host's real keyboard; `search_and_open_file` and
-`open_application` act on the server's desktop and shell. On a personal machine
-that is the feature. Behind a shared API, with a model steerable by untrusted
-retrieved text, it turns prompt injection into remote code execution.
+`Settings._harden` refuses to boot production with `max_tool_authority = HOST`
+or `min_code_isolation < SUBPROCESS`.
 
-Migration path for each is in [ARCHITECTURE.md §6](ARCHITECTURE.md).
+### The built-in tools
+
+| Tool | Authority | Isolation | Shippable |
+| --- | --- | --- | --- |
+| `calculator` | `PURE` | in-process | yes |
+| `memory_search` | `TENANT` | in-process | yes |
+| `python_exec` | `HOST` | subprocess | **no — desktop only** |
+
+`calculator` evaluates arithmetic by walking a parsed AST against an allowlist of
+*node types* — not a filtered `eval`. Attribute access, subscripts,
+comprehensions and unknown names have no branch, so there is no reachable path
+to `__class__` or `__import__`. It exists because the legacy prompt told the
+model to call `execute_python_code` for every calculation — arbitrary code
+execution for the sake of long multiplication.
+
+`memory_search` takes the tenant from the invocation context, never from an
+argument, so no injected instruction can steer it at another tenant's data.
+
+`python_exec` replaces `tools/code_exec.py`, which called `exec()` with full
+`__builtins__` in the API process. It now runs in a child process with a
+scrubbed environment (the parent's API keys and DSNs are simply absent), `-I`
+isolated mode, an empty temporary cwd, a hard timeout and capped output.
+
+**It still declares `Authority.HOST`, and that is deliberate.** On this platform
+the child runs as the same OS user, so it can reach the filesystem and open
+sockets — and Windows has no `resource` module, so CPU and memory limits are
+*not* enforced, only the wall clock. The declaration states what the tool can
+actually do, so every server policy refuses it. It becomes shippable when it
+runs in a container with no network and a read-only rootfs, at which point its
+authority genuinely drops to `PURE`. **Never widen the policy to fit a tool;
+change the tool and let its declaration follow.**
+
+The remaining legacy tools in `tools/` are still unported: `automate_typing`
+drives the host's real keyboard and has no server-side meaning at all;
+`open_application` and `search_and_open_file` act on the server's desktop and
+shell. `find_file_location` is superseded by `memory_search`.
 
 ---
 
@@ -265,9 +304,11 @@ behind `LLMClient`, so it is an adapter swap and nothing above it changes.
 | 2 | `LlamaCppClient` — native inference | **done** (unverified on real weights) |
 | 3 | RAG pipeline, local embeddings, vector stores | **done** |
 | 4 | Agent loop + tool executor | **done** |
-| 5 | `PostgresSessionStore`, Redis-backed limits | next |
-| 6 | Sandboxed tool runtime, then re-register tools | next |
-| 7 | Billing, usage metering, admin API | later |
+| 5 | Built-in tools + subprocess sandbox | **done** |
+| 6 | `PostgresSessionStore`, Redis-backed limits | next |
+| 7 | Container runtime, so `python_exec` can ship | next |
+| 8 | Network tools (HTTP fetch, web search) with an egress allowlist | next |
+| 9 | Billing, usage metering, admin API | later |
 
 Each lands behind a port that already exists, so nothing above it changes when
 it does.
