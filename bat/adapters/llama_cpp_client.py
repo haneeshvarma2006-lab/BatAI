@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import AsyncIterator, Sequence
@@ -54,19 +55,77 @@ class ModelUnavailableError(UpstreamError):
     public = True
 
 
+def _register_cuda_dll_paths() -> None:
+    """Make the pip-installed CUDA runtime discoverable on Windows.
+
+    The CUDA build of llama-cpp-python links against ``cublas64_12.dll`` and
+    friends. Those normally come from a CUDA Toolkit install; on a machine
+    without one the ``nvidia-*-cu12`` wheels supply them, but pip drops them
+    under ``site-packages/nvidia/*/bin``, which is not on Windows' DLL search
+    path. Without this, the import fails with a bare "Could not find module
+    llama.dll" -- which names the wrong file entirely.
+
+    Both mechanisms are applied on purpose. ``os.add_dll_directory`` is the
+    modern one, but llama-cpp-python loads its library with
+    ``winmode=RTLD_GLOBAL``, and that path does not consult those directories --
+    so on its own it silently does nothing. Prepending to ``PATH`` is what
+    actually resolves the dependency.
+
+    Silent no-op elsewhere: on Linux the wheels carry their own rpath, and the
+    CPU build needs none of this.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import nvidia
+    except ImportError:
+        return  # No pip-installed CUDA runtime; a toolkit install may still work.
+
+    directories = [
+        str(binary_dir)
+        for root in getattr(nvidia, "__path__", [])
+        for binary_dir in Path(root).glob("*/bin")
+        if binary_dir.is_dir()
+    ]
+    if not directories:
+        return
+
+    for directory in directories:
+        with contextlib.suppress(OSError):
+            os.add_dll_directory(directory)
+
+    current = os.environ.get("PATH", "")
+    missing = [d for d in directories if d not in current]
+    if missing:
+        os.environ["PATH"] = os.pathsep.join([*missing, current])
+
+
 def _import_llama() -> Any:
     """Import ``llama_cpp`` lazily, with an actionable message if it is absent.
 
     Kept out of module scope so the package imports (and the test suite runs)
     on machines without the compiled extension installed.
     """
+    _register_cuda_dll_paths()
     try:
         import llama_cpp
     except ImportError as exc:  # pragma: no cover - environment-dependent
         raise ModelUnavailableError(
-            "llama-cpp-python is not installed. Install it with "
-            "'pip install llama-cpp-python' (needs a prebuilt wheel for your "
-            "Python version, or cmake + a C++ toolchain to build from source)."
+            "llama-cpp-python is not installed. On Windows, PyPI has no wheel; "
+            "install from the maintainer's index, e.g. "
+            "'pip install llama-cpp-python --extra-index-url "
+            "https://abetlen.github.io/llama-cpp-python/whl/cpu' (or .../cu124 "
+            "for GPU, which also needs 'pip install nvidia-cublas-cu12 "
+            "nvidia-cuda-runtime-cu12')."
+        ) from exc
+    except (OSError, RuntimeError) as exc:  # pragma: no cover - env-dependent
+        # A CUDA build whose runtime DLLs are missing surfaces here, and the
+        # default message blames llama.dll rather than the real cause.
+        raise ModelUnavailableError(
+            f"llama-cpp-python is installed but its native library will not "
+            f"load ({exc}). For a CUDA build, install the runtime with "
+            "'pip install nvidia-cublas-cu12 nvidia-cuda-runtime-cu12', or "
+            "reinstall the CPU build."
         ) from exc
     return llama_cpp
 

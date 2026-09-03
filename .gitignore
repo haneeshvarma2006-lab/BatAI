@@ -18,3 +18,6 @@ brain_memory/
 # Local runtime data
 var/
 .env
+
+# Local venv for the 3.12 inference runtime
+.venv312/

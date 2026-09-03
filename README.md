@@ -18,7 +18,7 @@ Full design rationale lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | Tenancy, auth, scopes | **implemented** |
 | Session + transcript store | **implemented** (in-memory + Postgres) |
 | HTTP API, SSE streaming, rate limits | **implemented** |
-| Native `llama-cpp-python` inference | **implemented** — untested against real weights, see below |
+| Native `llama-cpp-python` inference | **implemented and running** on real weights |
 | Local `.gguf` embeddings | **implemented** |
 | RAG pipeline (chunk → embed → retrieve → budgeted context) | **implemented** |
 | Vector stores (in-memory + Chroma) | **implemented** |
@@ -282,40 +282,107 @@ and the limiter silently stops limiting while every health check stays green.
 
 ---
 
-## Running real inference
+## Running the model
 
-Point the config at a `.gguf` and restart — no code change:
+Inference needs **Python 3.12**, not 3.14 — `llama-cpp-python` has no wheel for
+3.14 on any platform yet.
+
+**On Windows, PyPI has no wheel at all**, for any Python version; `pip install
+llama-cpp-python` tries to build from source and fails without MSVC. Use the
+maintainer's index instead:
 
 ```bash
-pip install llama-cpp-python
+py -3.12 -m venv .venv312
 ```
 
+CPU build:
+
+```bash
+.venv312\Scripts\python -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 ```
-BAT_MODEL__MODEL_PATH=./models/your-model.Q4_K_M.gguf
-BAT_EMBEDDING__MODEL_PATH=./models/nomic-embed-text-v1.5.Q4_K_M.gguf
+
+CUDA build (NVIDIA GPU). The wheel links against the CUDA runtime, which the
+`nvidia-*-cu12` packages supply — no CUDA Toolkit install needed:
+
+```bash
+.venv312\Scripts\python -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 ```
 
-Three environment blockers on this machine, recorded so they don't need
-rediscovering:
+```bash
+.venv312\Scripts\python -m pip install nvidia-cublas-cu12 nvidia-cuda-runtime-cu12
+```
 
-1. **No `llama-cpp-python` wheel for Python 3.14.** It resolves only as an
-   sdist; `pip install --only-binary=:all:` finds no distribution. **Python 3.12
-   has prebuilt wheels and is the supported path.**
-2. **No build toolchain** — neither `cmake` nor MSVC `cl.exe` is on PATH, so a
-   source build fails until one is installed.
-3. **No `.gguf` weights** anywhere under the project.
+pip puts those DLLs under `site-packages/nvidia/*/bin`, which is not on Windows'
+DLL search path, so the import fails with a misleading "Could not find module
+llama.dll". `bat.adapters.llama_cpp_client` registers those directories before
+importing, so this works with no `PATH` fiddling — and if the runtime really is
+missing, the error names the actual cause.
 
-Two things to check first with real weights, because they are model-specific and
-a fake cannot cover them:
+Then point the config at your weights:
 
-- **Chat template.** `BAT_MODEL__CHAT_FORMAT` defaults to the template embedded
-  in the `.gguf`. If replies come back with role markers leaking into the text,
-  set it explicitly.
-- **Tool calling.** Native tool calls need a chat format that supports them
-  (`chatml-function-calling`, functionary, …). With a format that doesn't, the
-  model emits tool calls as prose and `wants_tools` stays false. Tools ship
-  disabled, so this affects nothing until you enable one — the durable fix is
-  GBNF grammar-constrained decoding.
+```
+BAT_MODEL__MODEL_PATH=D:/BatAI/models/bat-engine-3b-q4_k_m.gguf
+BAT_EMBEDDING__MODEL_PATH=D:/BatAI/models/bat-embed-nomic-v1.5-q4_k_m.gguf
+BAT_MODEL__CHAT_FORMAT=chatml-function-calling
+BAT_MODEL__N_GPU_LAYERS=0
+```
+
+`n_gpu_layers=-1` offloads every layer that fits; the CPU build ignores it.
+
+### `chat_format` is not optional if you want tools
+
+Under a `.gguf`'s own embedded template, Qwen2.5 emits its tool call as **plain
+text**:
+
+```
+<tool_call>{"name": "calculator", "arguments": {"expression": "27 * 43 + 119"}}</tool_call>
+```
+
+The loop never sees a tool call, `wants_tools` stays false, and the agent
+answers without using the tool — silently, with no error anywhere. Setting
+`BAT_MODEL__CHAT_FORMAT=chatml-function-calling` makes llama-cpp-python parse
+those blocks into structured calls. Verified: with it set, the model calls
+`calculator` and gets 1280 for `27 * 43 + 119`.
+
+### CUDA on this hardware
+
+The `cu124` wheel installs and initialises CUDA correctly (it detects the GPU
+and reports `supports_gpu_offload: True`), but **loading a model crashes with
+`0xc000001d`, STATUS_ILLEGAL_INSTRUCTION**. That is the wheel's CPU baseline,
+not CUDA: its ggml layer is built for an instruction set this CPU
+(i5-12450H, Alder Lake — AVX2, no AVX-512) does not implement. Nothing in the
+config can work around it.
+
+The CPU wheel runs fine, so that is what is configured. Getting GPU offload
+needs a llama-cpp-python built for this CPU, i.e. compiling from source with
+`-DGGML_CUDA=on` after installing MSVC Build Tools and CMake.
+
+### Two things to know about the weights
+
+**Measured on this machine** (i5-12450H, CPU only, Qwen2.5-3B Q4_K_M): loads in
+~4.5s, generates at ~5-7 tok/s. Slow but entirely usable for development.
+
+**A GGUF cannot be fine-tuned.** It is a quantised inference format — the
+weights are compressed for fast CPU/GPU decode, and the gradients needed for
+training are gone. Renaming the file changes nothing about that. To actually
+train on your own data you fine-tune the *original* checkpoint (safetensors,
+usually with LoRA), then convert and quantise the result back to GGUF with
+`llama.cpp/convert_hf_to_gguf.py`. The path is real, it just doesn't start from
+the file the server loads.
+
+**Check the licence before launch.** The bundled default is Qwen2.5-3B-Instruct,
+which ships under the **Qwen Research License — non-commercial**. That is fine
+for development and evaluation, and not fine for a commercial SaaS. Swap it
+before you charge anyone; the config is one line and nothing in the code
+changes. Commercially usable models of similar size:
+
+| Model | Licence |
+| --- | --- |
+| Llama-3.2-3B-Instruct | Llama 3.2 Community (commercial under 700M MAU, requires "Built with Llama" attribution) |
+| Qwen2.5-1.5B-Instruct | Apache 2.0 |
+| Phi-3.5-mini-instruct (3.8B) | MIT |
+
+---
 
 ### The capacity trade-off
 

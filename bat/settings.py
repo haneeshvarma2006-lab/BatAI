@@ -85,7 +85,10 @@ class ModelSettings(BaseModel):
     #: Generation threads. None lets llama.cpp pick from the CPU count.
     n_threads: int | None = Field(default=None, gt=0)
     n_batch: int = Field(default=512, gt=0)
-    #: Chat template. None uses the template embedded in the .gguf metadata.
+    #: Chat template. None uses the template embedded in the .gguf metadata --
+    #: which for most models means tool calls arrive as plain text and the agent
+    #: loop never sees them. Set "chatml-function-calling" for ChatML models
+    #: (Qwen, and others) to get structured tool calls.
     chat_format: str | None = None
     seed: int | None = None
     use_mmap: bool = True

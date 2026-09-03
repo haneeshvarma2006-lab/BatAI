@@ -148,9 +148,12 @@ class RedisTokenBucketLimiter:
             raise UpstreamError(f"rate limiter unavailable: {exc}") from exc
 
         if not int(allowed):
+            # Never report 0: a rejected caller always has some wait, and
+            # rounding a sub-millisecond deficit down tells the client to retry
+            # immediately, which just burns another request on another 429.
             raise RateLimitError(
                 "rate limit exceeded",
-                retry_after_seconds=round(float(retry_after), 3),
+                retry_after_seconds=max(0.001, round(float(retry_after), 3)),
                 details={"limit_per_second": self._rate, "burst": self._burst},
             )
 

@@ -446,13 +446,14 @@ class TestRowMapping(unittest.TestCase):
 class TestProductionGuards(unittest.TestCase):
     def test_in_process_rate_limiting_is_refused_in_production(self) -> None:
         with self.assertRaises(Exception) as caught:
-            Settings(environment="production")
+            Settings(_env_file=None, environment="production")
         self.assertIn("rate_limit.backend='memory'", str(caught.exception))
 
     def test_lease_shorter_than_the_run_deadline_is_refused(self) -> None:
         """Otherwise a live run's slot is released while it is still running."""
         with self.assertRaises(Exception) as caught:
             Settings(
+                _env_file=None,
                 environment="production",
                 agent=AgentSettings(deadline_s=600.0),
                 rate_limit=RateLimitSettings(

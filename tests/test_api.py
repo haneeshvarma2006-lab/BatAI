@@ -65,7 +65,11 @@ def build_settings(**overrides) -> Settings:
         ),
     }
     base.update(overrides)
-    return Settings(**base)
+    # `_env_file=None` keeps the suite hermetic. Settings normally loads `.env`,
+    # so without this a developer's local config (a model path, a Postgres DSN)
+    # silently changes what the tests build -- and they fail, or worse pass, for
+    # reasons that have nothing to do with the code.
+    return Settings(_env_file=None, **base)
 
 
 def auth(key: str) -> dict[str, str]:
@@ -411,7 +415,7 @@ class TestRateLimiting(ApiTestCase):
 class TestConfigurationSafety(unittest.TestCase):
     def test_production_rejects_development_defaults(self) -> None:
         with self.assertRaises(Exception) as caught:
-            Settings(environment="production")
+            Settings(_env_file=None, environment="production")
         message = str(caught.exception)
         self.assertIn("unsafe production configuration", message)
         for problem in ("api_keys", "model.model_path", "vector.mode", "session.backend"):
@@ -423,6 +427,7 @@ class TestConfigurationSafety(unittest.TestCase):
 
         with self.assertRaises(Exception) as caught:
             Settings(
+                _env_file=None,
                 environment="production",
                 agent=AgentSettings(max_tool_authority=Authority.HOST),
             )
@@ -430,6 +435,7 @@ class TestConfigurationSafety(unittest.TestCase):
 
         with self.assertRaises(Exception) as caught:
             Settings(
+                _env_file=None,
                 environment="production",
                 agent=AgentSettings(min_code_isolation=Isolation.IN_PROCESS),
             )
