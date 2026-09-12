@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from bat.domain.tenancy import DEFAULT_SCOPES, Scope, validate_tenant_id
-from bat.ports.tools import Isolation
+from bat.ports.tools import Authority, Isolation
 
 
 class Environment(StrEnum):
@@ -61,16 +61,108 @@ class ApiKeyRecord(BaseModel):
 
 
 class ModelSettings(BaseModel):
+    """Native llama.cpp inference settings.
+
+    Inference runs *inside* this process against a local .gguf file. There is no
+    model server, so the model is a process-local resource: one instance serves
+    one generation at a time and every worker holds its own full copy of the
+    weights in RAM. `max_queue_depth` is the admission bound that keeps that
+    honest under load -- see `bat.adapters.llama_cpp_client`.
+    """
+
     model_config = {"frozen": True}
 
-    provider: Literal["ollama"] = "ollama"
-    host: str = "http://127.0.0.1:11434"
+    provider: Literal["llama_cpp"] = "llama_cpp"
+    #: Path to the .gguf weights. Required before the API will serve turns.
+    model_path: Path | None = None
+    #: Display name used in logs and usage records.
     name: str = "bat-engine"
+
+    # -- llama.cpp load parameters ---------------------------------------
+    n_ctx: int = Field(default=8192, gt=0)
+    #: Layers offloaded to GPU. 0 = pure CPU; -1 = offload everything.
+    n_gpu_layers: int = Field(default=0, ge=-1)
+    #: Generation threads. None lets llama.cpp pick from the CPU count.
+    n_threads: int | None = Field(default=None, gt=0)
+    n_batch: int = Field(default=512, gt=0)
+    #: Chat template for ordinary generation. None uses the one embedded in
+    #: the .gguf metadata, which is normally what you want.
+    chat_format: str | None = None
+    #: Chat template used *only* on a turn where tools are advertised.
+    #:
+    #: These are separate because no single value works for both. Under a
+    #: model's own template, tool calls come back as plain text and the agent
+    #: loop never sees them. Under "chatml-function-calling" they parse
+    #: correctly -- but that handler then mangles the tool-result history when
+    #: it renders the follow-up, and the model answers with an invented number
+    #: instead of the one the tool returned. Measured on Qwen2.5-3B: the tool
+    #: computed 1280 and the reply said 1160.
+    #:
+    #: So the tool-calling handler is used for the turn that may emit a call,
+    #: and the model's own template for the turn that produces prose.
+    tool_chat_format: str | None = "chatml-function-calling"
+    seed: int | None = None
+    use_mmap: bool = True
+    use_mlock: bool = False
+    verbose: bool = False
+
+    # -- generation defaults ---------------------------------------------
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.95, gt=0.0, le=1.0)
     max_tokens: int = Field(default=2048, gt=0)
-    request_timeout_s: float = Field(default=90.0, gt=0)
-    #: Concurrent generations allowed per process, to protect the model server.
-    max_concurrency: int = Field(default=8, gt=0)
+    repeat_penalty: float = Field(default=1.1, gt=0)
+    request_timeout_s: float = Field(default=180.0, gt=0)
+
+    # -- admission --------------------------------------------------------
+    #: Callers allowed to wait for the single generation slot before new ones
+    #: are rejected outright. Queueing beyond this only burns client deadlines.
+    max_queue_depth: int = Field(default=8, gt=0)
+    #: Block startup until the weights are loaded. Off means the first request
+    #: pays the load cost and /readyz reports not-ready until it finishes.
+    preload: bool = True
+
+    @model_validator(mode="after")
+    def _check_paths(self) -> ModelSettings:
+        if self.model_path is not None and self.model_path.suffix.lower() != ".gguf":
+            raise ValueError(f"model_path must be a .gguf file, got {self.model_path}")
+        return self
+
+    @property
+    def is_configured(self) -> bool:
+        return self.model_path is not None
+
+
+class EmbeddingSettings(BaseModel):
+    """Embedding model for the RAG pipeline.
+
+    A separate .gguf loaded with ``embedding=True``. Kept distinct from the chat
+    model because embedding a document while a generation is in flight would
+    otherwise contend for the same serialized instance.
+    """
+
+    model_config = {"frozen": True}
+
+    model_path: Path | None = None
+    n_ctx: int = Field(default=2048, gt=0)
+    n_gpu_layers: int = Field(default=0, ge=-1)
+    n_threads: int | None = Field(default=None, gt=0)
+    n_batch: int = Field(default=512, gt=0)
+    #: Embed in batches so a large ingest does not hold the slot indefinitely.
+    batch_size: int = Field(default=16, gt=0)
+    normalize: bool = True
+    verbose: bool = False
+
+    @model_validator(mode="after")
+    def _check_paths(self) -> EmbeddingSettings:
+        if self.model_path is not None and self.model_path.suffix.lower() != ".gguf":
+            raise ValueError(
+                f"embedding model_path must be a .gguf file, got {self.model_path}"
+            )
+        return self
+
+    @property
+    def is_configured(self) -> bool:
+        return self.model_path is not None
 
 
 class VectorSettings(BaseModel):
@@ -83,11 +175,13 @@ class VectorSettings(BaseModel):
     host: str | None = None
     port: int = 8000
     ssl: bool = False
-    embedding_model: str = "nomic-embed-text"
     chunk_size: int = Field(default=1000, gt=0)
     chunk_overlap: int = Field(default=150, ge=0)
     default_top_k: int = Field(default=5, gt=0)
     context_token_budget: int = Field(default=1500, gt=0)
+    #: Retrieved chunks scoring below this are dropped rather than padding
+    #: the prompt with near-irrelevant text at full authority.
+    min_score: float = Field(default=0.25, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _check_mode(self) -> VectorSettings:
@@ -116,11 +210,26 @@ class SessionSettings(BaseModel):
             raise ValueError(f"session.dsn is required for backend={self.backend!r}")
         return self
 
+    @property
+    def pool_size(self) -> int:
+        return 10
+
 
 class RateLimitSettings(BaseModel):
     model_config = {"frozen": True}
 
     enabled: bool = True
+    #: ``memory`` is per-process, so the effective limit is replicas x
+    #: configured. ``redis`` makes it global; production requires it.
+    backend: Literal["memory", "redis"] = "memory"
+    dsn: SecretStr | None = None
+    #: On a Redis outage, allow requests rather than 503 the API. The right
+    #: trade when the limiter protects capacity; set False when it is a
+    #: billing or abuse control and over-admitting is worse than rejecting.
+    fail_open: bool = True
+    #: Lease lifetime for a run slot. Must exceed agent.deadline_s, or a live
+    #: run's lease expires and the tenant exceeds its ceiling.
+    lease_ttl_s: float = Field(default=300.0, gt=0)
     #: Sustained requests per second per tenant.
     requests_per_second: float = Field(default=5.0, gt=0)
     #: Burst allowance above the sustained rate.
@@ -129,6 +238,12 @@ class RateLimitSettings(BaseModel):
     #: capped separately from cheap CRUD calls.
     max_concurrent_runs: int = Field(default=4, gt=0)
 
+    @model_validator(mode="after")
+    def _check_dsn(self) -> RateLimitSettings:
+        if self.backend == "redis" and self.dsn is None:
+            raise ValueError("rate_limit.dsn is required for backend='redis'")
+        return self
+
 
 class AgentSettings(BaseModel):
     model_config = {"frozen": True}
@@ -136,9 +251,32 @@ class AgentSettings(BaseModel):
     max_steps: int = Field(default=6, gt=0, le=32)
     deadline_s: float = Field(default=120.0, gt=0)
     max_tool_calls_per_run: int = Field(default=8, gt=0)
-    #: Minimum isolation any tool must declare to be runnable. Production
-    #: configs are rejected below SUBPROCESS; see `Settings._harden`.
-    min_tool_isolation: Isolation = Isolation.NETWORK
+    #: How many rounds of tool calls the model gets before the loop stops
+    #: offering tools and asks for a plain answer.
+    #:
+    #: Defaults to 1 because llama.cpp's tool-calling chat handlers rewrite the
+    #: conversation when they render a prompt, and a history that already
+    #: contains tool results comes back mangled -- the model then answers with
+    #: a number the tool never returned. Measured on Qwen2.5-3B: the calculator
+    #: returned 1280 and the reply said 1160. Synthesising the answer without
+    #: the tool handler avoids that entirely.
+    #:
+    #: Raise it only for a model and handler you have actually verified keep
+    #: tool results intact across rounds. Two shapes were tried on Qwen2.5-3B
+    #: and both failed, so this is a measured default rather than caution:
+    #: with the tool protocol's own messages the model rebuilt the expression
+    #: from scratch and got it wrong; with prior results flattened into plain
+    #: turns it emitted "functions.calculator:" and no call at all. Flattening
+    #: *does* work for writing the final answer -- but only when tools are not
+    #: advertised on that turn, which is exactly what a value of 1 arranges.
+    tool_rounds_per_turn: int = Field(default=1, gt=0)
+    #: Ceiling on what a tool may reach. HOST is refused in production: a tool
+    #: with host reach on shared infrastructure turns prompt injection into
+    #: remote code execution.
+    max_tool_authority: Authority = Authority.NETWORK
+    #: Containment required of tools that run caller-supplied code.
+    min_code_isolation: Isolation = Isolation.SUBPROCESS
+    #: Tools this deployment opts in, by name. Empty means no tools at all.
     enabled_tools: frozenset[str] = frozenset()
 
 
@@ -165,6 +303,7 @@ class Settings(BaseSettings):
 
     api_keys: tuple[ApiKeyRecord, ...] = ()
     model: ModelSettings = ModelSettings()
+    embedding: EmbeddingSettings = EmbeddingSettings()
     vector: VectorSettings = VectorSettings()
     session: SessionSettings = SessionSettings()
     rate_limit: RateLimitSettings = RateLimitSettings()
@@ -197,6 +336,10 @@ class Settings(BaseSettings):
         problems: list[str] = []
         if not self.api_keys:
             problems.append("no api_keys configured; the API would reject every request")
+        if not self.model.is_configured:
+            problems.append(
+                "model.model_path is unset; the API cannot serve a single agent turn"
+            )
         if "*" in self.cors_origins:
             problems.append("cors_origins may not be '*' in production")
         if self.vector.mode == "memory":
@@ -206,10 +349,27 @@ class Settings(BaseSettings):
                 "session.backend='memory' is per-process; sessions would be lost on "
                 "restart and inconsistent across replicas"
             )
-        if self.agent.min_tool_isolation < Isolation.SUBPROCESS:
+        if self.rate_limit.enabled and self.rate_limit.backend == "memory":
             problems.append(
-                "agent.min_tool_isolation must be SUBPROCESS or stronger in production; "
-                "in-process tools give a tenant code execution on shared infrastructure"
+                "rate_limit.backend='memory' is per-process; the effective limit "
+                "becomes replicas x configured and moves when the cluster scales"
+            )
+        if self.rate_limit.lease_ttl_s <= self.agent.deadline_s:
+            problems.append(
+                "rate_limit.lease_ttl_s must exceed agent.deadline_s, or a live "
+                "run's slot is released while it is still running"
+            )
+        if self.agent.max_tool_authority >= Authority.HOST:
+            problems.append(
+                "agent.max_tool_authority must be below HOST in production; a tool "
+                "that can reach the host gives a tenant control of shared "
+                "infrastructure through prompt injection"
+            )
+        if self.agent.min_code_isolation < Isolation.SUBPROCESS:
+            problems.append(
+                "agent.min_code_isolation must be SUBPROCESS or stronger in "
+                "production; running caller-supplied code in the API process is "
+                "arbitrary code execution"
             )
         if problems:
             raise ValueError(

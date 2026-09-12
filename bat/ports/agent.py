@@ -40,6 +40,8 @@ class RunRequest:
     history: tuple[Message, ...] = ()
     policy: ToolPolicy = field(default_factory=ToolPolicy)
     max_steps: int = 6
+    #: Rounds of tool calls before the loop asks for a plain answer.
+    tool_rounds_per_turn: int = 1
     #: Wall-clock ceiling for the whole turn, tool calls included.
     deadline_s: float = 120.0
     stream_tokens: bool = True

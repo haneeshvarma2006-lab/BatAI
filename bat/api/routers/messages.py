@@ -62,7 +62,8 @@ def _policy_for(settings: Settings) -> ToolPolicy:
     """
     return ToolPolicy(
         allowed=frozenset(settings.agent.enabled_tools),
-        min_isolation=settings.agent.min_tool_isolation,
+        max_authority=settings.agent.max_tool_authority,
+        min_code_isolation=settings.agent.min_code_isolation,
         max_calls_per_run=settings.agent.max_tool_calls_per_run,
     )
 
@@ -103,6 +104,7 @@ async def _prepare(
         policy=_policy_for(settings),
         max_steps=settings.agent.max_steps,
         deadline_s=settings.agent.deadline_s,
+        tool_rounds_per_turn=settings.agent.tool_rounds_per_turn,
     )
     return session, user_message, run_request
 
