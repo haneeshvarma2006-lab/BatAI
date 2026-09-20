@@ -37,7 +37,7 @@ from bat.services.rag.pipeline import LocalMemoryPipeline
 from bat.tools.builtin import build_default_tools
 from bat.api.errors import install_error_handlers
 from bat.api.middleware import BodySizeLimitMiddleware, CorrelationMiddleware
-from bat.api.routers import health, memory, messages, sessions
+from bat.api.routers import health, memory, messages, sessions, ui
 from bat.api.security import ApiKeyAuthenticator
 from bat.observability import configure_logging
 from bat.ports.session_store import SessionStore
@@ -306,6 +306,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(sessions.router)
     app.include_router(messages.router)
     app.include_router(memory.router)
+    app.include_router(ui.router)
 
     return app
 

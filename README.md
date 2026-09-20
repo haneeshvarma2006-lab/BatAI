@@ -77,7 +77,8 @@ python -m bat.cli check-config
 python -m bat.cli serve --reload
 ```
 
-Interactive docs at `http://127.0.0.1:8000/docs`.
+Chat UI at `http://127.0.0.1:8000/` — paste your key, it's kept in the browser.
+API docs at `http://127.0.0.1:8000/docs`.
 
 ### Talk to it
 
@@ -99,6 +100,7 @@ curl -N -X POST http://127.0.0.1:8000/v1/sessions/$SESSION_ID/messages/stream -H
 
 | Method | Path | Scope |
 | --- | --- | --- |
+| `GET` | `/` | none — the chat UI |
 | `GET` | `/healthz` | none — liveness |
 | `GET` | `/readyz` | none — readiness |
 | `GET` | `/v1/whoami` | any valid key |
@@ -201,6 +203,7 @@ or `min_code_isolation < SUBPROCESS`.
 | --- | --- | --- | --- |
 | `calculator` | `PURE` | in-process | yes |
 | `memory_search` | `TENANT` | in-process | yes |
+| `web_search` | `NETWORK` | in-process | yes |
 | `python_exec` | `HOST` | subprocess | **no — desktop only** |
 
 `calculator` evaluates arithmetic by walking a parsed AST against an allowlist of
@@ -212,6 +215,11 @@ execution for the sake of long multiplication.
 
 `memory_search` takes the tenant from the invocation context, never from an
 argument, so no injected instruction can steer it at another tenant's data.
+
+`web_search` is DuckDuckGo via `ddgs` — no API key. The model supplies a query
+string, never a URL, so the only host ever contacted is DuckDuckGo and there is
+no SSRF surface. Results are live, so it is never served from the turn cache.
+Swap in Google Custom Search or similar if you want it; that needs a key.
 
 `python_exec` replaces `tools/code_exec.py`, which called `exec()` with full
 `__builtins__` in the API process. It now runs in a child process with a
@@ -501,7 +509,7 @@ behind `LLMClient`, so it is an adapter swap and nothing above it changes.
 | 5 | Built-in tools + subprocess sandbox | **done** |
 | 6 | `PostgresSessionStore`, Redis limits and run leases | **done** (Postgres SQL unrun) |
 | 7 | Container runtime, so `python_exec` can ship | next |
-| 8 | Network tools (HTTP fetch, web search) with an egress allowlist | next |
+| 8 | Web search (DuckDuckGo) + chat UI | **done** |
 | 9 | Billing, usage metering, admin API | later |
 
 Each lands behind a port that already exists, so nothing above it changes when

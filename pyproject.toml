@@ -31,6 +31,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["bat*"]
 
+[tool.setuptools.package-data]
+bat = ["ui/*.html"]
+
 [tool.ruff]
 line-length = 96
 target-version = "py312"

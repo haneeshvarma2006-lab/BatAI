@@ -1,23 +1,23 @@
-# Virtual environment
-venv/
-__pycache__/
-*.pyc
 
-# Local vector storage and databases
-brain_memory/
-*.db
-*.sqlite3
-
-# Large AI model weights
-*.gguf
-*.bin
-*.safetensors
 
 # Environment secrets
-.env
+# Large AI model weights
 # Local runtime data
-var/
-.env
-
+# Local vector storage and databases
 # Local venv for the 3.12 inference runtime
+# Virtual environment
+*.bin
+*.db
+*.gguf
+*.pyc
+*.safetensors
+*.sqlite3
+.env
 .venv312/
+.venv312/
+__pycache__/
+brain_memory/
+var/
+var/
+venv/
+server.py

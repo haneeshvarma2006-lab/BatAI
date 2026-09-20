@@ -17,6 +17,7 @@ to ``PURE`` and the declaration changes with the implementation.
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
 import math
 import operator
@@ -317,6 +318,77 @@ class PythonExecTool:
         return result.render()
 
 
+
+# ---------------------------------------------------------------------------
+# web_search -- NETWORK authority, fixed egress to DuckDuckGo only
+# ---------------------------------------------------------------------------
+
+
+class WebSearchTool:
+    """Live web search via DuckDuckGo.
+
+    ``Authority.NETWORK`` with no allowlist needed: the only host ever contacted
+    is DuckDuckGo, and the model supplies a query string, never a URL -- so there
+    is no SSRF surface to guard. Results are untrusted text like any retrieved
+    context; the system prompt already tells the model to treat them as data.
+
+    ``deterministic=False`` because the web changes between calls.
+    """
+
+    __slots__ = ("_max_results",)
+
+    def __init__(self, max_results: int = 5) -> None:
+        self._max_results = max_results
+
+    definition = ToolDefinition(
+        name="web_search",
+        description=(
+            "Search the web for current or external information the user's "
+            "stored documents do not cover. Returns titles, URLs and snippets."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search terms."}
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        authority=Authority.NETWORK,
+        isolation=Isolation.IN_PROCESS,
+        side_effect=SideEffect.READ_ONLY,
+        required_scopes=frozenset({Scope.TOOLS_EXECUTE}),
+        timeout_s=20.0,
+        deterministic=False,
+    )
+
+    async def run(self, invocation: ToolInvocation) -> str:
+        query = str(invocation.arguments["query"]).strip()
+        if not query:
+            raise ToolError("query must not be empty")
+        try:
+            from ddgs import DDGS
+        except ImportError as exc:
+            raise ToolError("web search unavailable: install the 'ddgs' package") from exc
+
+        try:
+            results = await asyncio.to_thread(
+                lambda: DDGS().text(query, max_results=self._max_results)
+            )
+        except Exception as exc:
+            raise ToolError(f"search failed: {exc}") from exc
+
+        if not results:
+            return f"No web results for {query!r}."
+        lines = [f"Web results for {query!r}:"]
+        for hit in results:
+            title = hit.get("title", "").strip()
+            href = hit.get("href", "").strip()
+            body = hit.get("body", "").strip()
+            lines.append(f"- {title}\n  {href}\n  {body}")
+        return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # assembly
 # ---------------------------------------------------------------------------
@@ -330,7 +402,7 @@ def build_default_tools(
     A tool appearing here is still unusable until its name is in the tenant's
     allowlist *and* its declared authority fits the deployment's ceiling.
     """
-    tools: list[Any] = [CalculatorTool(), PythonExecTool()]
+    tools: list[Any] = [CalculatorTool(), WebSearchTool(), PythonExecTool()]
     if memory is not None:
         settings = vector_settings or VectorSettings()
         tools.append(
@@ -345,4 +417,6 @@ def build_default_tools(
 
 #: Safe to enable on a shared, multi-tenant deployment: no host reach, no
 #: caller-supplied code.
-SAAS_SAFE_TOOLS: Final[frozenset[str]] = frozenset({"calculator", "memory_search"})
+SAAS_SAFE_TOOLS: Final[frozenset[str]] = frozenset(
+    {"calculator", "memory_search", "web_search"}
+)

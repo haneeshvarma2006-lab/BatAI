@@ -268,7 +268,32 @@ class TestExecutorWithBuiltins(unittest.TestCase):
             min_code_isolation=SAAS_BASELINE_POLICY.min_code_isolation,
         )
         names = sorted(s.name for s in self.registry.specs_for(policy))
-        self.assertEqual(names, ["calculator", "memory_search"])
+        self.assertEqual(names, ["calculator", "memory_search", "web_search"])
+
+    def test_web_search_is_network_authority_and_never_cached(self) -> None:
+        """A query string, never a URL, so no SSRF surface; live, so not cached."""
+        from bat.tools.builtin import WebSearchTool
+
+        definition = WebSearchTool.definition
+        self.assertEqual(definition.authority, Authority.NETWORK)
+        self.assertFalse(definition.deterministic)
+        self.assertNotIn("url", definition.parameters["properties"])
+
+    def test_web_search_formats_results(self) -> None:
+        import sys
+        import types
+
+        from bat.tools.builtin import WebSearchTool
+
+        class FakeDDGS:
+            def text(self, query, max_results=5):
+                return [{"title": "T", "href": "https://x", "body": "snippet"}]
+
+        sys.modules["ddgs"] = types.SimpleNamespace(DDGS=FakeDDGS)
+        self.addCleanup(sys.modules.pop, "ddgs", None)
+        out = run(WebSearchTool().run(invocation("web_search", {"query": "bat"})))
+        self.assertIn("https://x", out)
+        self.assertIn("snippet", out)
 
     def test_denied_tool_yields_an_observation_not_an_exception(self) -> None:
         policy = ToolPolicy(
