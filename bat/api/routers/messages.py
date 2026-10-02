@@ -19,7 +19,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Path, Request
 from fastapi.responses import StreamingResponse
@@ -36,6 +36,8 @@ from bat.ports.agent import (
     FinalEvent,
     RunRequest,
     TokenEvent,
+    ToolCallEvent,
+    ToolResultEvent,
     collect,
 )
 from bat.ports.session_store import SessionStore
@@ -52,6 +54,9 @@ SessionId = Annotated[str, Path(pattern=r"^sess_[0-9a-f]{32}$")]
 #: Sent every 15s of silence so proxies and load balancers keep the SSE
 #: connection open during a long tool call.
 _KEEPALIVE_INTERVAL_S = 15.0
+
+#: Stored tool output is for display; a web page of results needn't live forever.
+_TOOL_RESULT_CAP = 2000
 
 
 def _policy_for(settings: Settings) -> ToolPolicy:
@@ -116,6 +121,7 @@ async def _persist_reply(
     session_id: str,
     content: str,
     stop_reason: str,
+    tools: list[dict[str, Any]] | None = None,
 ) -> Message:
     return await store.append_message(
         tenant_id=context.tenant_id,
@@ -125,7 +131,9 @@ async def _persist_reply(
             tenant_id=context.tenant_id,
             role=Role.ASSISTANT,
             content=content,
-            metadata={"stop_reason": stop_reason},
+            # Tool activity rides in metadata so a reloaded transcript can show
+            # what the agent did, not just what it said.
+            metadata={"stop_reason": stop_reason, "tools": tools or []},
         ),
     )
 
@@ -240,6 +248,7 @@ async def _sse_stream(
 ) -> AsyncIterator[str]:
     """Forward agent events as SSE frames, persisting the reply at the end."""
     buffered: list[str] = []
+    tools: list[dict[str, Any]] = []
     try:
         async with limiter.slot(context.tenant_id):
             events = runner.run(run_request)
@@ -266,8 +275,14 @@ async def _sse_stream(
                             session_id=session_id,
                             content=content,
                             stop_reason=str(event.stop_reason),
+                            tools=tools,
                         )
                     break
+                if isinstance(event, ToolCallEvent):
+                    tools.append({"name": event.name, "arguments": event.arguments})
+                if isinstance(event, ToolResultEvent) and tools:
+                    tools[-1]["result"] = event.content[:_TOOL_RESULT_CAP]
+                    tools[-1]["is_error"] = event.is_error
                 if isinstance(event, ErrorEvent):
                     break
                 if isinstance(event, TokenEvent):

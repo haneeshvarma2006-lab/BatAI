@@ -77,7 +77,10 @@ python -m bat.cli check-config
 python -m bat.cli serve --reload
 ```
 
-Chat UI at `http://127.0.0.1:8000/` — paste your key, it's kept in the browser.
+Chat UI at `http://127.0.0.1:8000/` — sign in with your key (kept in the browser).
+Chat history in the sidebar, live tool activity, stop button, markdown, a
+Memory panel to add documents for RAG, light/dark, and a mobile layout.
+Plain HTML/CSS/JS in `bat/ui/`, no build step.
 API docs at `http://127.0.0.1:8000/docs`.
 
 ### Talk to it

@@ -306,7 +306,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(sessions.router)
     app.include_router(messages.router)
     app.include_router(memory.router)
-    app.include_router(ui.router)
+    ui.mount(app)
 
     return app
 

@@ -89,6 +89,15 @@ class ToolCallResponse(_Base):
     arguments: dict[str, Any]
 
 
+class ToolActivityResponse(_Base):
+    """A tool the agent ran while producing this message, and what it saw."""
+
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    result: str | None = None
+    is_error: bool = False
+
+
 class MessageResponse(_Base):
     id: str
     session_id: str
@@ -96,6 +105,7 @@ class MessageResponse(_Base):
     content: str
     created_at: datetime
     tool_calls: tuple[ToolCallResponse, ...] = ()
+    tools: tuple[ToolActivityResponse, ...] = ()
 
     @classmethod
     def from_domain(cls, message: Message) -> Self:
@@ -108,6 +118,11 @@ class MessageResponse(_Base):
             tool_calls=tuple(
                 ToolCallResponse(id=c.id, name=c.name, arguments=c.arguments)
                 for c in message.tool_calls
+            ),
+            tools=tuple(
+                ToolActivityResponse(**t)
+                for t in message.metadata.get("tools") or ()
+                if isinstance(t, dict) and t.get("name")
             ),
         )
 
